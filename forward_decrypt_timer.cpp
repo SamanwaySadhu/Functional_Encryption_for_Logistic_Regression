@@ -19,8 +19,8 @@
 #include <omp.h>
 #endif
 
-#define FEATURE_SIZE 30
-#define NUM_SAMPLES 569
+#define FEATURE_SIZE 4
+#define NUM_SAMPLES 150
 #define DIM_M (FEATURE_SIZE + 2)
 
 long long total_decrypt_ms = 0;
@@ -89,9 +89,7 @@ struct DecryptPhaseArtifacts {
 };
 
 size_t estimate_lut_size_bytes(const EncryptedLookupTable& lut) {
-    size_t total = sizeof(EncryptedLookupTable);
-    total += lut.slots.capacity() * sizeof(EncryptedLookupRow);
-    total += lut.occupied.capacity() * sizeof(unsigned char);
+    size_t total = lut.occupied.capacity() * sizeof(unsigned char) / 8;
 
     for (const auto& row : lut.slots) {
         total += row.nonce.capacity() * sizeof(unsigned char);
@@ -103,8 +101,7 @@ size_t estimate_lut_size_bytes(const EncryptedLookupTable& lut) {
 }
 
 size_t estimate_lut_row_size_bytes(const EncryptedLookupRow& row) {
-    size_t total = sizeof(EncryptedLookupRow);
-    total += row.nonce.capacity() * sizeof(unsigned char);
+    size_t total = row.nonce.capacity() * sizeof(unsigned char);
     total += row.ciphertext.capacity() * sizeof(unsigned char);
     total += row.tag.capacity() * sizeof(unsigned char);
     return total;
@@ -200,6 +197,13 @@ std::vector<unsigned char> serialize_element_to_bytes(element_t e) {
     int len = element_length_in_bytes(e);
     std::vector<unsigned char> out(len);
     element_to_bytes(out.data(), e);
+    return out;
+}
+
+std::vector<unsigned char> serialize_g1_element_to_compressed_bytes(element_t e) {
+    int len = element_length_in_bytes_compressed(e);
+    std::vector<unsigned char> out(len);
+    element_to_bytes_compressed(out.data(), e);
     return out;
 }
 
@@ -381,7 +385,7 @@ EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk,
             element_pow_zn(g1_val, pk->g1_base, exp1);
 
             std::vector<unsigned char> gt_bytes = serialize_element_to_bytes(gt_val);
-            std::vector<unsigned char> g1_bytes = serialize_element_to_bytes(g1_val);
+            std::vector<unsigned char> g1_bytes = serialize_g1_element_to_compressed_bytes(g1_val);
 
             std::vector<unsigned char> plaintext = g1_bytes;
 
@@ -475,7 +479,7 @@ bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
 
         std::vector<unsigned char> row_g1_bytes = plaintext;
         element_init_G1(L_in_G1, pairing);
-        element_from_bytes(L_in_G1, row_g1_bytes.data());
+        element_from_bytes_compressed(L_in_G1, row_g1_bytes.data());
         if (verbose) {
             printf("Lookup completed with success\n");
         }
@@ -878,8 +882,8 @@ int main() {
 
     pairing_t pairing;
     pbc_param_t pbc_param;
-    // pbc_param_init_a_gen(pbc_param, 80, 256);
-    pbc_param_init_a_gen(pbc_param, 160, 512);
+    pbc_param_init_a_gen(pbc_param, 80, 256);
+    // pbc_param_init_a_gen(pbc_param, 160, 512);
     pairing_init_pbc_param(pairing, pbc_param);
     pbc_param_clear(pbc_param);
 
