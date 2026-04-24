@@ -1,0 +1,7 @@
+# Ignore files without an extension (e.g., compiled binaries)
+*
+!*.*
+!*/
+
+# Keep this ignore file tracked
+!.gitignore
