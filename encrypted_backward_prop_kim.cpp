@@ -1531,7 +1531,7 @@ int main() {
         for (int i = 0; i < BATCH_SIZE; i++) {
             y[i] = MAX_X * generate_random_int(0, 1);
             y_hat[i] = generate_random_int(0, MAX_X);
-            x[i] = generate_random_int(MIN_X, MAX_X);
+            x[i] = (feature == FEATURE_SIZE - 1)? MAX_X: generate_random_int(MIN_X, MAX_X);
             output_values -= (y[i] - y_hat[i]) * x[i];
         }
 
