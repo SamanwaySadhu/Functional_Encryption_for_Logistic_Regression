@@ -19,9 +19,13 @@
 #include <omp.h>
 #endif
 
-#define FEATURE_SIZE 4
+#define FEATURE_SIZE 5
 #define NUM_SAMPLES 150
-#define DIM_M (FEATURE_SIZE + 2)
+#define DIM_M (FEATURE_SIZE + 1)
+#define BATCH_SIZE 4
+#define QUANTIZATION_BITS 6
+#define MIN_X -(1 << (QUANTIZATION_BITS - 1))
+#define MAX_X (1 << (QUANTIZATION_BITS - 1)) - 1
 
 long long total_decrypt_ms = 0;
 double total_lookup_us = 0.0;
@@ -70,7 +74,7 @@ struct SampleArtifacts {
     DecryptionKey sk;
     Ciphertext ct;
     EncryptedLookupTable lut;
-    long r4 = 0;
+    long r2 = 0;
     long r3 = 0;
     long expected_output = 0;
     long output_values = 0;
@@ -82,7 +86,7 @@ struct SampleArtifacts {
 struct DecryptPhaseArtifacts {
     element_t D1;
     element_t D2;
-    element_t L_in_G1;
+    element_t L_in_G1[FEATURE_SIZE][BATCH_SIZE + 1];
     bool has_D1 = false;
     bool has_D2 = false;
     bool has_L_in_G1 = false;
@@ -92,18 +96,14 @@ size_t estimate_lut_size_bytes(const EncryptedLookupTable& lut) {
     size_t total = lut.occupied.capacity() * sizeof(unsigned char) / 8;
 
     for (const auto& row : lut.slots) {
-        total += row.nonce.capacity() * sizeof(unsigned char);
         total += row.ciphertext.capacity() * sizeof(unsigned char);
-        total += row.tag.capacity() * sizeof(unsigned char);
     }
 
     return total;
 }
 
 size_t estimate_lut_row_size_bytes(const EncryptedLookupRow& row) {
-    size_t total = row.nonce.capacity() * sizeof(unsigned char);
-    total += row.ciphertext.capacity() * sizeof(unsigned char);
-    total += row.tag.capacity() * sizeof(unsigned char);
+    size_t total = row.ciphertext.capacity() * sizeof(unsigned char);
     return total;
 }
 
@@ -336,10 +336,10 @@ long double sigmoid(long double x) {
 }
 
 int non_linear_transform(long double x) {
-    return static_cast<int>(sigmoid(x / (1 << 14)) * (1 << 7));
+    return static_cast<int>(sigmoid(x / (1 << (2 * QUANTIZATION_BITS - 2)) * (1 << (QUANTIZATION_BITS - 1))));
 }
 
-EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk, int min_x, int max_x, int r3, int r4, element_t alpha, element_t beta, element_t det_B) {
+EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk, int min_x, int max_x, int r3, int r2, element_t alpha, element_t beta, element_t det_B, int z1, int z4, element_t betad[FEATURE_SIZE], element_t Bstar[FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1], int idx) {
     EncryptedLookupTable lut;
     lut.min_x = min_x;
     lut.max_x = max_x;
@@ -370,24 +370,43 @@ EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk,
 
 #pragma omp for schedule(static)
         for (int x = min_x; x <= max_x; x++) {
-            element_t expt, exp1, gt_val, g1_val;
+            element_t expt, exp1, gt_val;
             element_init_Zr(expt, pairing);
             element_init_Zr(exp1, pairing);
             element_init_GT(gt_val, pairing);
-            element_init_G1(g1_val, pairing);
 
-            element_set_si(expt, r4 * x + r3);
+            element_set_si(expt, r2 * x + r3);
             element_mul(expt, expt, alpha);
             element_mul(expt, expt, beta);
             element_mul(expt, expt, det_B);
-            element_set_si(exp1, r4 * non_linear_transform((long double)x) + r3);
+            element_set_si(exp1, z1 * non_linear_transform((long double)x) + z4);
             element_pow_zn(gt_val, pk->gT_base, expt);
-            element_pow_zn(g1_val, pk->g1_base, exp1);
 
             std::vector<unsigned char> gt_bytes = serialize_element_to_bytes(gt_val);
-            std::vector<unsigned char> g1_bytes = serialize_g1_element_to_compressed_bytes(g1_val);
+            std::vector<unsigned char> plaintext;
 
-            std::vector<unsigned char> plaintext = g1_bytes;
+            element_t base_exp, slot_exp, slot_g1;
+            element_init_Zr(base_exp, pairing);
+            element_init_Zr(slot_exp, pairing);
+            element_init_G1(slot_g1, pairing);
+
+            for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+                for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                    element_mul(base_exp,
+                                betad[feature_idx],
+                                Bstar[feature_idx][idx][batch_idx]);
+                    element_mul(slot_exp, base_exp, exp1);
+                    element_pow_zn(slot_g1, pk->g1_base, slot_exp);
+
+                    std::vector<unsigned char> slot_bytes =
+                        serialize_g1_element_to_compressed_bytes(slot_g1);
+                    plaintext.insert(plaintext.end(), slot_bytes.begin(), slot_bytes.end());
+                }
+            }
+
+            element_clear(base_exp);
+            element_clear(slot_exp);
+            element_clear(slot_g1);
 
             std::vector<unsigned char> key;
             if (hkdf_sha256(gt_bytes, salt, info, HKDF_KEY_LEN, key)) {
@@ -402,7 +421,6 @@ EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk,
             element_clear(expt);
             element_clear(exp1);
             element_clear(gt_val);
-            element_clear(g1_val);
         }
     }
 
@@ -439,7 +457,7 @@ EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk,
 bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
                                    element_t L_T,
                                    const EncryptedLookupTable& lut,
-                                   element_t L_in_G1,
+                                   element_t L_in_G1[FEATURE_SIZE][BATCH_SIZE + 1],
                                    bool verbose = true) {
     std::vector<unsigned char> salt = {'G','T','2','G','1','-','L','U','T','-','S','A','L','T'};
     std::vector<unsigned char> info = {'H','K','D','F','-','S','H','A','2','5','6','-','R','O','W'};
@@ -477,9 +495,29 @@ bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
             continue;
         }
 
-        std::vector<unsigned char> row_g1_bytes = plaintext;
-        element_init_G1(L_in_G1, pairing);
-        element_from_bytes_compressed(L_in_G1, row_g1_bytes.data());
+        element_t g1_probe;
+        element_init_G1(g1_probe, pairing);
+        int g1_comp_len = element_length_in_bytes_compressed(g1_probe);
+        element_clear(g1_probe);
+
+        size_t expected_len = static_cast<size_t>(FEATURE_SIZE) *
+                              static_cast<size_t>(BATCH_SIZE + 1) *
+                              static_cast<size_t>(g1_comp_len);
+        if (plaintext.size() != expected_len) {
+            continue;
+        }
+
+        size_t offset = 0;
+        for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+            for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                element_init_G1(L_in_G1[feature_idx][batch_idx], pairing);
+                element_from_bytes_compressed(
+                    L_in_G1[feature_idx][batch_idx],
+                    const_cast<unsigned char*>(plaintext.data() + offset));
+                offset += static_cast<size_t>(g1_comp_len);
+            }
+        }
+
         if (verbose) {
             printf("Lookup completed with success\n");
         }
@@ -579,6 +617,103 @@ int invert_and_det_matrix_Fq(pairing_t pairing, element_t M[DIM_M][DIM_M], eleme
     element_clear(factor);
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < 2 * DIM_M; j++) {
+            element_clear(aug[i][j]);
+        }
+    }
+
+    return 1;
+}
+
+int invert_and_det_matrix_Fq_batch(pairing_t pairing,
+                                   element_t M[BATCH_SIZE + 1][BATCH_SIZE + 1],
+                                   element_t inverse[BATCH_SIZE + 1][BATCH_SIZE + 1],
+                                   element_t det) {
+    element_t aug[BATCH_SIZE + 1][2 * (BATCH_SIZE + 1)];
+    element_t temp, pivot_inv, factor;
+
+    element_init_Zr(temp, pairing);
+    element_init_Zr(pivot_inv, pairing);
+    element_init_Zr(factor, pairing);
+
+    element_set1(det);
+    int sign = 1;
+
+    for (int i = 0; i < BATCH_SIZE + 1; i++) {
+        for (int j = 0; j < BATCH_SIZE + 1; j++) {
+            element_init_Zr(aug[i][j], pairing);
+            element_set(aug[i][j], M[i][j]);
+
+            element_init_Zr(aug[i][j + (BATCH_SIZE + 1)], pairing);
+            if (i == j) {
+                element_set1(aug[i][j + (BATCH_SIZE + 1)]);
+            } else {
+                element_set0(aug[i][j + (BATCH_SIZE + 1)]);
+            }
+        }
+    }
+
+    for (int i = 0; i < BATCH_SIZE + 1; i++) {
+        int pivot_row = i;
+        for (int k = i + 1; k < BATCH_SIZE + 1; k++) {
+            if (!element_is0(aug[k][i])) {
+                pivot_row = k;
+                break;
+            }
+        }
+        if (element_is0(aug[pivot_row][i])) {
+            element_set0(det);
+            for (int r = 0; r < BATCH_SIZE + 1; r++) {
+                for (int c = 0; c < 2 * (BATCH_SIZE + 1); c++) {
+                    element_clear(aug[r][c]);
+                }
+            }
+            element_clear(temp);
+            element_clear(pivot_inv);
+            element_clear(factor);
+            return 0;
+        }
+
+        if (pivot_row != i) {
+            for (int j = 0; j < 2 * (BATCH_SIZE + 1); j++) {
+                element_set(temp, aug[i][j]);
+                element_set(aug[i][j], aug[pivot_row][j]);
+                element_set(aug[pivot_row][j], temp);
+            }
+            sign = -sign;
+        }
+
+        element_mul(det, det, aug[i][i]);
+        element_invert(pivot_inv, aug[i][i]);
+        for (int j = 0; j < 2 * (BATCH_SIZE + 1); j++) {
+            element_mul(aug[i][j], aug[i][j], pivot_inv);
+        }
+
+        for (int k = 0; k < BATCH_SIZE + 1; k++) {
+            if (k != i) {
+                element_set(factor, aug[k][i]);
+                for (int j = 0; j < 2 * (BATCH_SIZE + 1); j++) {
+                    element_mul(temp, factor, aug[i][j]);
+                    element_sub(aug[k][j], aug[k][j], temp);
+                }
+            }
+        }
+    }
+
+    if (sign == -1) {
+        element_neg(det, det);
+    }
+
+    for (int i = 0; i < BATCH_SIZE + 1; i++) {
+        for (int j = 0; j < BATCH_SIZE + 1; j++) {
+            element_set(inverse[i][j], aug[i][j + (BATCH_SIZE + 1)]);
+        }
+    }
+
+    element_clear(temp);
+    element_clear(pivot_inv);
+    element_clear(factor);
+    for (int i = 0; i < BATCH_SIZE + 1; i++) {
+        for (int j = 0; j < 2 * (BATCH_SIZE + 1); j++) {
             element_clear(aug[i][j]);
         }
     }
@@ -756,7 +891,11 @@ void ClearSampleArtifacts(SampleArtifacts* sample) {
 
 void ClearDecryptPhaseArtifacts(DecryptPhaseArtifacts* artifacts) {
     if (artifacts->has_L_in_G1) {
-        element_clear(artifacts->L_in_G1);
+        for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+            for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                element_clear(artifacts->L_in_G1[feature_idx][batch_idx]);
+            }
+        }
         artifacts->has_L_in_G1 = false;
     }
     if (artifacts->has_D2) {
@@ -819,7 +958,7 @@ bool Decrypt(pairing_t pairing, PublicKey* pk, DecryptionKey* sk, Ciphertext* ct
     // Pass D2 off to the LUT. In a fully symmetric system where D1 changes organically, 
     // LUT structure would hash a pairing derived value or be modified, but we pass D2 
     // seamlessly directly down here.
-    element_t L_in_G1;
+    element_t L_in_G1[FEATURE_SIZE][BATCH_SIZE + 1];
     if (!MapLTinGTtoG1WithEncryptedLUT(pairing, D2, lut, L_in_G1, verbose)) {
         printf("Failed to map D2 from GT to G1 using encrypted LUT.\n");
         element_clear(D1);
@@ -828,29 +967,33 @@ bool Decrypt(pairing_t pairing, PublicKey* pk, DecryptionKey* sk, Ciphertext* ct
         return false;
     }
 
-    element_t lut_exp, expected_L_in_G1;
-    element_init_Zr(lut_exp, pairing);
-    element_init_G1(expected_L_in_G1, pairing);
-    element_set_si(lut_exp, r4 * non_linear_transform((long double)output_value) + r3);
-    element_pow_zn(expected_L_in_G1, pk->g1, lut_exp);
-    if (element_cmp(L_in_G1, expected_L_in_G1) != 0) {
-        printf("[ASSERTION FAILED] L_in_G1 != g1^(r4 * non_linear_transform(output_value) + r3)\n");
-        element_clear(lut_exp);
-        element_clear(expected_L_in_G1);
-        element_clear(L_in_G1);
-        element_clear(D1);
-        element_clear(D2);
-        element_clear(temp_pairing);
-        return false;
-    }
+    // element_t lut_exp, expected_L_in_G1;
+    // element_init_Zr(lut_exp, pairing);
+    // element_init_G1(expected_L_in_G1, pairing);
+    // element_set_si(lut_exp, r4 * non_linear_transform((long double)output_value) + r3);
+    // element_pow_zn(expected_L_in_G1, pk->g1, lut_exp);
+    // if (element_cmp(L_in_G1, expected_L_in_G1) != 0) {
+    //     printf("[ASSERTION FAILED] L_in_G1 != g1^(r4 * non_linear_transform(output_value) + r3)\n");
+    //     element_clear(lut_exp);
+    //     element_clear(expected_L_in_G1);
+    //     element_clear(L_in_G1);
+    //     element_clear(D1);
+    //     element_clear(D2);
+    //     element_clear(temp_pairing);
+    //     return false;
+    // }
 
     if (verbose) {
         printf("Mapped D2 from GT to G1 using encrypted LUT.\n");
     }
 
-    element_clear(lut_exp);
-    element_clear(expected_L_in_G1);
-    element_clear(L_in_G1);
+    // element_clear(lut_exp);
+    // element_clear(expected_L_in_G1);
+    for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+        for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+            element_clear(L_in_G1[feature_idx][batch_idx]);
+        }
+    }
 
     element_clear(D1);
     element_clear(D2);
@@ -877,7 +1020,7 @@ int main() {
 
 #ifdef _OPENMP
     omp_set_dynamic(0);
-    omp_set_num_threads(32);
+    omp_set_num_threads(omp_get_max_threads());
 #endif
 
     pairing_t pairing;
@@ -895,14 +1038,68 @@ int main() {
     double decrypt_bilinear_parallel_ms = 0.0;
     double decrypt_expected_cmp_ms = 0.0;
     double decrypt_lookup_parallel_ms = 0.0;
+    double c2_generation_parallel_ms = 0.0;
     double decrypt_final_cmp_ms = 0.0;
     bool failed = false;
     int failed_sample = -1;
 
-    std::vector<SampleArtifacts> samples(NUM_SAMPLES);
+    std::vector<SampleArtifacts> samples(BATCH_SIZE);
+
+    int z1 = generate_random_int(-(1 << 15), (1 << 15) - 1);
+    int z4[BATCH_SIZE];
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        z4[i] = generate_random_int(-(1 << 15), (1 << 15) - 1);
+    }
+    element_t betad[FEATURE_SIZE];
+    element_t Bstar[FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1];
+    for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+        element_init_Zr(betad[feature_idx], pairing);
+        element_random(betad[feature_idx]);
+
+        element_t B[BATCH_SIZE + 1][BATCH_SIZE + 1];
+        element_t B_inv[BATCH_SIZE + 1][BATCH_SIZE + 1];
+        element_t det_B_feature;
+        element_t tmp;
+        element_init_Zr(det_B_feature, pairing);
+        element_init_Zr(tmp, pairing);
+
+        for (int i = 0; i < BATCH_SIZE + 1; i++) {
+            for (int j = 0; j < BATCH_SIZE + 1; j++) {
+                element_init_Zr(B[i][j], pairing);
+                element_init_Zr(B_inv[i][j], pairing);
+                element_init_Zr(Bstar[feature_idx][i][j], pairing);
+            }
+        }
+
+        int is_invertible = 0;
+        while (!is_invertible) {
+            for (int i = 0; i < BATCH_SIZE + 1; i++) {
+                for (int j = 0; j < BATCH_SIZE + 1; j++) {
+                    element_random(B[i][j]);
+                }
+            }
+            is_invertible = invert_and_det_matrix_Fq_batch(pairing, B, B_inv, det_B_feature);
+        }
+
+        for (int i = 0; i < BATCH_SIZE + 1; i++) {
+            for (int j = 0; j < BATCH_SIZE + 1; j++) {
+                element_mul(tmp, det_B_feature, B_inv[j][i]);
+                element_set(Bstar[feature_idx][i][j], tmp);
+            }
+        }
+
+        element_clear(tmp);
+        element_clear(det_B_feature);
+        for (int i = 0; i < BATCH_SIZE + 1; i++) {
+            for (int j = 0; j < BATCH_SIZE + 1; j++) {
+                element_clear(B[i][j]);
+                element_clear(B_inv[i][j]);
+            }
+        }
+    }
 
     // Phase 1: setup, keygen, encrypt, LUT build, and store all artifacts.
-    for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+    for (int sample = 0; sample < BATCH_SIZE; sample++) {
         SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
         auto sample_phase1_start = std::chrono::steady_clock::now();
 
@@ -924,44 +1121,31 @@ int main() {
 
         long w[FEATURE_SIZE];
         long x[FEATURE_SIZE];
-        long bias;
-        long r2[FEATURE_SIZE + 1];
+        long r1[FEATURE_SIZE];
         long x_values[DIM_M];
         long y_values[DIM_M];
         long r3 = generate_random_int(-(1 << 15), (1 << 15) - 1);
-        long r4 = generate_random_int(-(1 << 15), (1 << 15) - 1);
+        long r2 = generate_random_int(-(1 << 15), (1 << 15) - 1);
 
         long output_values = 0;
         for (int i = 0; i < FEATURE_SIZE; i++) {
-            w[i] = generate_random_int(-128, 127);
-            x[i] = generate_random_int(-128, 127);
+            w[i] = generate_random_int(MIN_X, MAX_X);
+            x[i] = (i == FEATURE_SIZE -1)? MAX_X: generate_random_int(MIN_X, MAX_X);
             output_values += w[i] * x[i];
         }
 
         y_values[DIM_M - 1] = r3;
-        for (int i = 0; i < FEATURE_SIZE + 1; i++) {
-            r2[i] = generate_random_int(-(1 << 15), (1 << 15) - 1);
-            if (i < FEATURE_SIZE) {
-                y_values[DIM_M - 1] -= x[i] * r2[i];
-            } else {
-                y_values[DIM_M - 1] -= 128 * r2[i];
-            }
+        x_values[DIM_M - 1] = 1;
+        for (int i = 0; i < FEATURE_SIZE; i++) {
+            r1[i] = generate_random_int(-(1 << 15), (1 << 15) - 1);
+            y_values[DIM_M - 1] -= x[i] * r1[i];
         }
-
-        bias = generate_random_int(-128, 127);
-        output_values += bias * 128;
 
         long expected_output = 0;
         for (int i = 0; i < FEATURE_SIZE; i++) {
-            x_values[i] = r4 * w[i] + r2[i];
-        }
-        x_values[DIM_M - 2] = r4 * bias + r2[DIM_M - 2];
-        x_values[DIM_M - 1] = 1;
-
-        for (int i = 0; i < FEATURE_SIZE; i++) {
+            x_values[i] = r2 * w[i] + r1[i];
             y_values[i] = x[i];
         }
-        y_values[DIM_M - 2] = 128;
 
         for (int j = 0; j < DIM_M; j++) {
             element_init_Zr(x_vec[j], pairing);
@@ -971,13 +1155,12 @@ int main() {
             expected_output += x_values[j] * y_values[j];
         }
 
-        if (expected_output != (r4 * output_values + r3)) {
-            printf("\n[ASSERTION FAILED] expected_output != r4 * output_values + r3 at sample %d\n", sample);
+        if (expected_output != (r2 * output_values + r3)) {
+            printf("\n[ASSERTION FAILED] expected_output != r2 * output_values + r3 at sample %d\n", sample);
             for (int i = 0; i < FEATURE_SIZE; i++) {
-                printf("index=%d, x=%ld, w=%ld, r2=%ld\n", i, x[i], w[i], r2[i]);
+                printf("index=%d, x=%ld, w=%ld, r2=%ld\n", i, x[i], w[i], r1[i]);
             }
-            printf("index=%d, r2=%ld (bias slot)\n", FEATURE_SIZE, r2[FEATURE_SIZE]);
-            printf("bias=%ld, r3=%ld, r4=%ld\n", bias, r3, r4);
+            printf("r2=%ld, r3=%ld\n", r2, r3);
             printf("output_value=%ld, expected_output=%ld\n", output_values, expected_output);
 
             for (int i = 0; i < DIM_M; i++) {
@@ -1006,14 +1189,14 @@ int main() {
         total_encrypt_ms += std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
-        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, -(FEATURE_SIZE + 1) * 128 * 127, (FEATURE_SIZE + 1) * 127 * 127, r3, r4, alpha_sample, beta_sample, msk.det_B);
+        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, (FEATURE_SIZE) * (MIN_X) * (MAX_X), (FEATURE_SIZE) * (MAX_X) * (MAX_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
         stop = std::chrono::steady_clock::now();
         total_lut_build_ms += std::chrono::duration<double, std::milli>(stop - start).count();
         size_t lut_size_bytes = estimate_lut_size_bytes(sample_data.lut);
         total_lut_size_bytes += static_cast<long double>(lut_size_bytes);
 
         sample_data.r3 = r3;
-        sample_data.r4 = r4;
+        sample_data.r2 = r2;
         sample_data.expected_output = expected_output;
         sample_data.output_values = output_values;
 
@@ -1047,10 +1230,10 @@ int main() {
 
     if (!failed) {
         // Phase 2.1.1: bilinear operations initialization in parallel (wall-clock timed).
-        std::vector<DecryptPhaseArtifacts> decrypt_artifacts(static_cast<size_t>(NUM_SAMPLES));
+        std::vector<DecryptPhaseArtifacts> decrypt_artifacts(static_cast<size_t>(BATCH_SIZE));
 
-        element_t temp_pairing[NUM_SAMPLES];
-        for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+        element_t temp_pairing[BATCH_SIZE];
+        for (int sample = 0; sample < BATCH_SIZE; sample++) {
             SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
             DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
 
@@ -1068,7 +1251,7 @@ int main() {
         // Phase 2.1.2: bilinear operations in parallel (wall-clock timed).
         auto bilinear_start = std::chrono::steady_clock::now();
 #pragma omp parallel for schedule(static)
-        for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+        for (int sample = 0; sample < BATCH_SIZE; sample++) {
             SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
             DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
             for (int i = 0; i < DIM_M; i++) {
@@ -1080,13 +1263,13 @@ int main() {
         decrypt_bilinear_parallel_ms = std::chrono::duration<double, std::milli>(bilinear_stop - bilinear_start).count();
 
         // Phase 2.1.3: bilinear operations teardown
-        for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+        for (int sample = 0; sample < BATCH_SIZE; sample++) {
             element_clear(temp_pairing[sample]);
         }
         
 
         // Phase 2.2: compare D1^expected_output == D2.
-        for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+        for (int sample = 0; sample < BATCH_SIZE; sample++) {
             SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
             DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
 
@@ -1110,11 +1293,11 @@ int main() {
 
         // Phase 2.3: LUT lookup in parallel (wall-clock timed).
         if (!failed) {
-            std::vector<int> lookup_status(static_cast<size_t>(NUM_SAMPLES), 1);
+            std::vector<int> lookup_status(static_cast<size_t>(BATCH_SIZE), 1);
             auto lookup_start = std::chrono::steady_clock::now();
 
 #pragma omp parallel for schedule(static)
-            for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+            for (int sample = 0; sample < BATCH_SIZE; sample++) {
                 SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
                 DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
                 if (!MapLTinGTtoG1WithEncryptedLUT(pairing,
@@ -1131,7 +1314,7 @@ int main() {
             auto lookup_stop = std::chrono::steady_clock::now();
             decrypt_lookup_parallel_ms = std::chrono::duration<double, std::milli>(lookup_stop - lookup_start).count();
 
-            for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+            for (int sample = 0; sample < BATCH_SIZE; sample++) {
                 if (lookup_status[static_cast<size_t>(sample)] == 0) {
                     printf("[ASSERTION FAILED] Lookup failed at sample %d\n", sample);
                     failed = true;
@@ -1141,20 +1324,77 @@ int main() {
             }
         }
 
-        // Phase 2.4: final G1 comparison.
+        // Phase 2.4: final ciphertext generation
+        element_t C2[FEATURE_SIZE][BATCH_SIZE + 1];
+        bool has_C2 = false;
         if (!failed) {
-            for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+            has_C2 = true;
+
+            auto c2_start = std::chrono::steady_clock::now();
+
+#pragma omp parallel for collapse(2) schedule(static)
+            for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+                for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                    element_init_G1(C2[feature_idx][batch_idx], pairing);
+                    element_set1(C2[feature_idx][batch_idx]);
+
+                    for (int sample = 0; sample < BATCH_SIZE; sample++) {
+                        DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
+                        element_mul(C2[feature_idx][batch_idx],
+                                    C2[feature_idx][batch_idx],
+                                    phase_data.L_in_G1[feature_idx][batch_idx]);
+                    }
+
+                    // Uses the final row (index BATCH_SIZE) of each feature's B* matrix.
+                    element_t tail_exp, tail_term;
+                    element_init_Zr(tail_exp, pairing);
+                    element_init_G1(tail_term, pairing);
+                    element_set(tail_exp, Bstar[feature_idx][BATCH_SIZE][batch_idx]);
+                    element_pow_zn(tail_term, samples[0].pk.g1, tail_exp);
+                    element_mul(C2[feature_idx][batch_idx],
+                                C2[feature_idx][batch_idx],
+                                tail_term);
+                    element_clear(tail_exp);
+                    element_clear(tail_term);
+                }
+            }
+
+            auto c2_stop = std::chrono::steady_clock::now();
+            c2_generation_parallel_ms =
+                std::chrono::duration<double, std::milli>(c2_stop - c2_start).count();
+            printf("Ciphertext generation parallel loop total: %.3f ms\n", c2_generation_parallel_ms);
+        }
+
+        // Phase 2.5: final G1 comparison.
+        if (!failed) {
+            for (int sample = 0; sample < BATCH_SIZE; sample++) {
                 SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
                 DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
 
-                element_t lut_exp, expected_L_in_G1;
+                element_t lut_exp, expected_slot_exp, expected_L_in_G1;
                 element_init_Zr(lut_exp, pairing);
+                element_init_Zr(expected_slot_exp, pairing);
                 element_init_G1(expected_L_in_G1, pairing);
-                element_set_si(lut_exp, sample_data.r4 * non_linear_transform((long double)sample_data.output_values) + sample_data.r3);
-                element_pow_zn(expected_L_in_G1, sample_data.pk.g1, lut_exp);
+                element_set_si(lut_exp, z1 * non_linear_transform((long double)sample_data.output_values) + z4[sample]);
 
-                bool eq = (element_cmp(phase_data.L_in_G1, expected_L_in_G1) == 0);
+                bool eq = true;
+                for (int feature_idx = 0; feature_idx < FEATURE_SIZE && eq; feature_idx++) {
+                    for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                        element_mul(expected_slot_exp,
+                                    betad[feature_idx],
+                                    Bstar[feature_idx][sample][batch_idx]);
+                        element_mul(expected_slot_exp, expected_slot_exp, lut_exp);
+                        element_pow_zn(expected_L_in_G1, sample_data.pk.g1, expected_slot_exp);
+
+                        if (element_cmp(phase_data.L_in_G1[feature_idx][batch_idx], expected_L_in_G1) != 0) {
+                            eq = false;
+                            break;
+                        }
+                    }
+                }
+
                 element_clear(lut_exp);
+                element_clear(expected_slot_exp);
                 element_clear(expected_L_in_G1);
 
                 if (!eq) {
@@ -1166,12 +1406,20 @@ int main() {
             }
         }
 
-        for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+        if (has_C2) {
+            for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+                for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+                    element_clear(C2[feature_idx][batch_idx]);
+                }
+            }
+        }
+
+        for (int sample = 0; sample < BATCH_SIZE; sample++) {
             ClearDecryptPhaseArtifacts(&decrypt_artifacts[static_cast<size_t>(sample)]);
         }
     }
 
-    for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+    for (int sample = 0; sample < BATCH_SIZE; sample++) {
         ClearSampleArtifacts(&samples[static_cast<size_t>(sample)]);
     }
 
@@ -1181,27 +1429,30 @@ int main() {
         return 1;
     }
 
-    printf("\n=== Benchmark Summary (%d samples) ===\n", NUM_SAMPLES);
+    printf("\n=== Benchmark Summary (%d samples) ===\n", BATCH_SIZE);
     printf("KeyGen total: %lld ms, average: %.3f ms\n",
            total_keygen_ms,
-           static_cast<double>(total_keygen_ms) / NUM_SAMPLES);
+           static_cast<double>(total_keygen_ms) / BATCH_SIZE);
     printf("Encrypt total: %lld ms, average: %.3f ms\n",
            total_encrypt_ms,
-           static_cast<double>(total_encrypt_ms) / NUM_SAMPLES);
+           static_cast<double>(total_encrypt_ms) / BATCH_SIZE);
     printf("Decrypt bilinear parallel loop total: %.3f ms, average: %.3f ms\n",
             decrypt_bilinear_parallel_ms,
-            decrypt_bilinear_parallel_ms / NUM_SAMPLES);
+            decrypt_bilinear_parallel_ms / BATCH_SIZE);
     printf("Decrypt lookup parallel loop total: %.3f ms, average: %.3f ms\n",
             decrypt_lookup_parallel_ms,
-            decrypt_lookup_parallel_ms / NUM_SAMPLES);
+            decrypt_lookup_parallel_ms / BATCH_SIZE);
+        printf("C2 generation parallel loop total: %.3f ms, average: %.3f ms\n",
+            c2_generation_parallel_ms,
+            c2_generation_parallel_ms / BATCH_SIZE);
     printf("Setup total: %.3f ms, average: %.3f ms\n",
             total_setup_ms,
-            total_setup_ms / NUM_SAMPLES);
+            total_setup_ms / BATCH_SIZE);
     printf("LUT build total: %.3f ms, average: %.3f ms\n",
             total_lut_build_ms,
-            total_lut_build_ms / NUM_SAMPLES);
-    printf("Cumulative LUT size: %.6Lf GB\n",
-            total_lut_size_bytes / (1024.0L * 1024.0L * 1024.0L));
+            total_lut_build_ms / BATCH_SIZE);
+    printf("Cumulative LUT size: %.6Lf MB\n",
+            total_lut_size_bytes / (1024.0L * 1024.0L));
 
     pairing_clear(pairing);
 
