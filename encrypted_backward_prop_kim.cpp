@@ -903,26 +903,30 @@ void KeyGen(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t x[
     element_pow_zn(sk->K1, pk->g1, temp_scalar);
 
     // K2 = g1^(alpha * x * B)
-    element_t dot_product, term;
-    element_init_Zr(dot_product, pairing);
-    element_init_Zr(term, pairing);
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
+        element_t dot_product, term;
+        element_init_Zr(dot_product, pairing);
+        element_init_Zr(term, pairing);
+
         element_set0(dot_product);
         for (int j = 0; j < DIM_M; j++) {
             element_mul(term, x[j], msk->B[j][i]);
             element_add(dot_product, dot_product, term);
         }
         element_mul(dot_product, dot_product, alpha);
-        
+
         element_init_G1(sk->K2[i], pairing);
         element_pow_zn(sk->K2[i], pk->g1, dot_product);
+
+        element_clear(dot_product);
+        element_clear(term);
     }
 
     element_clear(alpha);
     element_clear(temp_scalar);
-    element_clear(dot_product);
-    element_clear(term);
 }
 
 // --- 3. Encrypt Algorithm (Kim et al. Section 3) ---
@@ -937,11 +941,14 @@ void Encrypt(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t y
     element_pow_zn(ct->C1, pk->g2, beta);
 
     // C2 = g2^(beta * y * B_star)
-    element_t dot_product, term;
-    element_init_Zr(dot_product, pairing);
-    element_init_Zr(term, pairing);
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
+        element_t dot_product, term;
+        element_init_Zr(dot_product, pairing);
+        element_init_Zr(term, pairing);
+
         element_set0(dot_product);
         for (int j = 0; j < DIM_M; j++) {
             element_mul(term, y[j], msk->B_star[j][i]);
@@ -951,11 +958,12 @@ void Encrypt(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t y
 
         element_init_G2(ct->C2[i], pairing);
         element_pow_zn(ct->C2[i], pk->g2, dot_product);
+
+        element_clear(dot_product);
+        element_clear(term);
     }
 
     element_clear(beta);
-    element_clear(dot_product);
-    element_clear(term);
 }
 
 void ClearDecryptionKey(DecryptionKey* sk) {
@@ -1417,8 +1425,8 @@ int main() {
     double total_setup_ms = 0.0;
     double total_lut_build_ms = 0.0;
     long double total_lut_size_bytes = 0.0L;
-    long long total_keygen_ms = 0;
-    long long total_encrypt_ms = 0;
+    long long total_keygen_us = 0;
+    long long total_encrypt_us = 0;
 
     int r2 = generate_random_int(-(1 << 15), (1 << 15) - 1);
     int Z1 = generate_random_int(-(1 << 15), (1 << 15) - 1);
@@ -1605,12 +1613,12 @@ int main() {
         start = std::chrono::steady_clock::now();
         KeyGen(pairing, &s.pk, &s.msk, y_vec, &s.sk, s.alpha_sample);
         stop = std::chrono::steady_clock::now();
-        total_keygen_ms += std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+        total_keygen_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
         Encrypt(pairing, &s.pk, &s.msk, x_vec, &s.ct, s.beta_sample);
         stop = std::chrono::steady_clock::now();
-        total_encrypt_ms += std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+        total_encrypt_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
         s.lut = BuildEncryptedLookupTable(pairing, &s.pk, (BATCH_SIZE) * (MIN_X) * (MAX_X), BATCH_SIZE * (MAX_X) * (MAX_X), z3 - z4, z1, s.alpha_sample, s.beta_sample, s.msk.det_B);
@@ -2251,10 +2259,12 @@ int main() {
     double lookup_total_ms = phase4_ms + phase7_ms;
 
     printf("\n=== Benchmark Summary ===\n");
-    printf("KeyGen total: %lld ms\n",
-           total_keygen_ms);
-    printf("Encrypt total: %lld ms\n",
-           total_encrypt_ms);
+        printf("KeyGen total: %lld us, average: %.3f us\n",
+            total_keygen_us,
+            static_cast<double>(total_keygen_us) / FEATURE_SIZE);
+        printf("Encrypt total: %lld us, average: %.3f us\n",
+            total_encrypt_us,
+            static_cast<double>(total_encrypt_us) / FEATURE_SIZE);
     printf("Setup total: %.3f ms\n",
             total_setup_ms);
     printf("LUT build total: %.3f ms\n",

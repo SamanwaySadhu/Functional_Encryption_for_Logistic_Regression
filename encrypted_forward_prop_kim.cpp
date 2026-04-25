@@ -787,26 +787,30 @@ void KeyGen(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t x[
     element_pow_zn(sk->K1, pk->g1, temp_scalar);
 
     // K2 = g1^(alpha * x * B)
-    element_t dot_product, term;
-    element_init_Zr(dot_product, pairing);
-    element_init_Zr(term, pairing);
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
+        element_t dot_product, term;
+        element_init_Zr(dot_product, pairing);
+        element_init_Zr(term, pairing);
+
         element_set0(dot_product);
         for (int j = 0; j < DIM_M; j++) {
             element_mul(term, x[j], msk->B[j][i]);
             element_add(dot_product, dot_product, term);
         }
         element_mul(dot_product, dot_product, alpha);
-        
+
         element_init_G1(sk->K2[i], pairing);
         element_pow_zn(sk->K2[i], pk->g1, dot_product);
+
+        element_clear(dot_product);
+        element_clear(term);
     }
 
     element_clear(alpha);
     element_clear(temp_scalar);
-    element_clear(dot_product);
-    element_clear(term);
 }
 
 // --- 3. Encrypt Algorithm (Kim et al. Section 3) ---
@@ -821,11 +825,14 @@ void Encrypt(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t y
     element_pow_zn(ct->C1, pk->g2, beta);
 
     // C2 = g2^(beta * y * B_star)
-    element_t dot_product, term;
-    element_init_Zr(dot_product, pairing);
-    element_init_Zr(term, pairing);
-
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
+        element_t dot_product, term;
+        element_init_Zr(dot_product, pairing);
+        element_init_Zr(term, pairing);
+
         element_set0(dot_product);
         for (int j = 0; j < DIM_M; j++) {
             element_mul(term, y[j], msk->B_star[j][i]);
@@ -835,11 +842,12 @@ void Encrypt(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk, element_t y
 
         element_init_G2(ct->C2[i], pairing);
         element_pow_zn(ct->C2[i], pk->g2, dot_product);
+
+        element_clear(dot_product);
+        element_clear(term);
     }
 
     element_clear(beta);
-    element_clear(dot_product);
-    element_clear(term);
 }
 
 void ClearDecryptionKey(DecryptionKey* sk) {
@@ -1033,8 +1041,8 @@ int main() {
     double total_setup_ms = 0.0;
     double total_lut_build_ms = 0.0;
     long double total_lut_size_bytes = 0.0L;
-    long long total_keygen_ms = 0;
-    long long total_encrypt_ms = 0;
+    long long total_keygen_us = 0;
+    long long total_encrypt_us = 0;
     double decrypt_bilinear_parallel_ms = 0.0;
     double decrypt_expected_cmp_ms = 0.0;
     double decrypt_lookup_parallel_ms = 0.0;
@@ -1180,13 +1188,13 @@ int main() {
         KeyGen(pairing, &sample_data.pk, &msk, y_vec, &sample_data.sk, alpha_sample);
         sample_data.has_sk = true;
         stop = std::chrono::steady_clock::now();
-        total_keygen_ms += std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+        total_keygen_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
         Encrypt(pairing, &sample_data.pk, &msk, x_vec, &sample_data.ct, beta_sample);
         sample_data.has_ct = true;
         stop = std::chrono::steady_clock::now();
-        total_encrypt_ms += std::chrono::duration_cast<std::chrono::milliseconds>(stop - start).count();
+        total_encrypt_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
         sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, (FEATURE_SIZE) * (MIN_X) * (MAX_X), (FEATURE_SIZE) * (MAX_X) * (MAX_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
@@ -1430,12 +1438,12 @@ int main() {
     }
 
     printf("\n=== Benchmark Summary (%d samples) ===\n", BATCH_SIZE);
-    printf("KeyGen total: %lld ms, average: %.3f ms\n",
-           total_keygen_ms,
-           static_cast<double>(total_keygen_ms) / BATCH_SIZE);
-    printf("Encrypt total: %lld ms, average: %.3f ms\n",
-           total_encrypt_ms,
-           static_cast<double>(total_encrypt_ms) / BATCH_SIZE);
+        printf("KeyGen total: %lld us, average: %.3f us\n",
+            total_keygen_us,
+            static_cast<double>(total_keygen_us) / BATCH_SIZE);
+        printf("Encrypt total: %lld us, average: %.3f us\n",
+            total_encrypt_us,
+            static_cast<double>(total_encrypt_us) / BATCH_SIZE);
     printf("Decrypt bilinear parallel loop total: %.3f ms, average: %.3f ms\n",
             decrypt_bilinear_parallel_ms,
             decrypt_bilinear_parallel_ms / BATCH_SIZE);
