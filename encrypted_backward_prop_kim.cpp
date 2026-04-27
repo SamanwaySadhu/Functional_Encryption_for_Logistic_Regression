@@ -745,15 +745,17 @@ bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
 // --- Modified Matrix Inversion over Fq using Gaussian Elimination (Simultaneous Inv & Det) ---
 int invert_and_det_matrix_Fq(pairing_t pairing, element_t M[DIM_M][DIM_M], element_t inverse[DIM_M][DIM_M], element_t det) {
     element_t aug[DIM_M][2 * DIM_M];
-    element_t temp, pivot_inv, factor;
+    element_t temp, pivot_inv;
     
     element_init_Zr(temp, pairing);
     element_init_Zr(pivot_inv, pairing);
-    element_init_Zr(factor, pairing);
     
     element_set1(det);
     int sign = 1;
 
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < DIM_M; j++) {
             element_init_Zr(aug[i][j], pairing);
@@ -785,7 +787,6 @@ int invert_and_det_matrix_Fq(pairing_t pairing, element_t M[DIM_M][DIM_M], eleme
             }
             element_clear(temp);
             element_clear(pivot_inv);
-            element_clear(factor);
             return 0; // Singular matrix encountered
         }
 
@@ -800,17 +801,29 @@ int invert_and_det_matrix_Fq(pairing_t pairing, element_t M[DIM_M][DIM_M], eleme
 
         element_mul(det, det, aug[i][i]);
         element_invert(pivot_inv, aug[i][i]);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int j = 0; j < 2 * DIM_M; j++) {
             element_mul(aug[i][j], aug[i][j], pivot_inv);
         }
 
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int k = 0; k < DIM_M; k++) {
             if (k != i) {
+                element_t factor;
+                element_t local_temp;
+                element_init_Zr(factor, pairing);
+                element_init_Zr(local_temp, pairing);
                 element_set(factor, aug[k][i]);
                 for (int j = 0; j < 2 * DIM_M; j++) {
-                    element_mul(temp, factor, aug[i][j]);
-                    element_sub(aug[k][j], aug[k][j], temp);
+                    element_mul(local_temp, factor, aug[i][j]);
+                    element_sub(aug[k][j], aug[k][j], local_temp);
                 }
+                element_clear(factor);
+                element_clear(local_temp);
             }
         }
     }
@@ -827,7 +840,6 @@ int invert_and_det_matrix_Fq(pairing_t pairing, element_t M[DIM_M][DIM_M], eleme
 
     element_clear(temp);
     element_clear(pivot_inv);
-    element_clear(factor);
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < 2 * DIM_M; j++) {
             element_clear(aug[i][j]);
@@ -854,6 +866,9 @@ void Setup(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk) {
     element_init_Zr(msk->det_B, pairing);
 
     element_t B_inv[DIM_M][DIM_M];
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < DIM_M; j++) {
             element_init_Zr(msk->B[i][j], pairing);
@@ -864,6 +879,9 @@ void Setup(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk) {
 
     int is_invertible = 0;
     while (!is_invertible) {
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
         for (int i = 0; i < DIM_M; i++) {
             for (int j = 0; j < DIM_M; j++) {
                 element_random(msk->B[i][j]);
@@ -872,16 +890,22 @@ void Setup(pairing_t pairing, PublicKey* pk, MasterSecretKey* msk) {
         is_invertible = invert_and_det_matrix_Fq(pairing, msk->B, B_inv, msk->det_B);
     }
 
-    element_t temp;
-    element_init_Zr(temp, pairing);
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < DIM_M; j++) {
-            element_mul(temp, msk->det_B, B_inv[j][i]);
-            element_set(msk->B_star[i][j], temp);
+            element_t local_temp;
+            element_init_Zr(local_temp, pairing);
+            element_mul(local_temp, msk->det_B, B_inv[j][i]);
+            element_set(msk->B_star[i][j], local_temp);
+            element_clear(local_temp);
         }
     }
     
-    element_clear(temp);
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
     for (int i = 0; i < DIM_M; i++) {
         for (int j = 0; j < DIM_M; j++) {
             element_clear(B_inv[i][j]);
