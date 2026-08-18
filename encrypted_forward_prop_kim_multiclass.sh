@@ -31,6 +31,14 @@ match($0, /^Decrypt bilinear parallel loop total: ([0-9.]+) ms, average: ([0-9.]
 	bilinear_total += m[1]
 	bilinear_avg += m[2]
 }
+match($0, /^Truncation lookup parallel loop total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
+	trunc_lookup_total += m[1]
+	trunc_lookup_avg += m[2]
+}
+match($0, /^Softmax lookup parallel loop total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
+	softmax_lookup_total += m[1]
+	softmax_lookup_avg += m[2]
+}
 match($0, /^Decrypt lookup parallel loop total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
 	lookup_total += m[1]
 	lookup_avg += m[2]
@@ -43,9 +51,23 @@ match($0, /^Setup total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
 	setup_total += m[1]
 	setup_avg += m[2]
 }
+match($0, /^Truncation LUT build total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
+	trunc_lut_build_total += m[1]
+	trunc_lut_build_avg += m[2]
+}
+match($0, /^Softmax LUT build total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
+	softmax_lut_build_total += m[1]
+	softmax_lut_build_avg += m[2]
+}
 match($0, /^LUT build total: ([0-9.]+) ms, average: ([0-9.]+) ms$/, m) {
 	lut_total += m[1]
 	lut_avg += m[2]
+}
+match($0, /^Truncation LUT cumulative size: ([0-9.]+) MB$/, m) {
+	trunc_lut_size += m[1]
+}
+match($0, /^Softmax LUT cumulative size: ([0-9.]+) MB$/, m) {
+	softmax_lut_size += m[1]
 }
 match($0, /^Cumulative LUT size: ([0-9.]+) MB$/, m) {
 	lut_size += m[1]
@@ -61,10 +83,16 @@ END {
 	printf "KeyGen total: %.3f us, average: %.3f us\n", keygen_total / runs, keygen_avg / runs
 	printf "Encrypt total: %.3f us, average: %.3f us\n", encrypt_total / runs, encrypt_avg / runs
 	printf "Decrypt bilinear parallel loop total: %.3f ms, average: %.3f ms\n", bilinear_total / runs, bilinear_avg / runs
+	printf "Truncation lookup parallel loop total: %.3f ms, average: %.3f ms\n", trunc_lookup_total / runs, trunc_lookup_avg / runs
+	printf "Softmax lookup parallel loop total: %.3f ms, average: %.3f ms\n", softmax_lookup_total / runs, softmax_lookup_avg / runs
 	printf "Decrypt lookup parallel loop total: %.3f ms, average: %.3f ms\n", lookup_total / runs, lookup_avg / runs
 	printf "C2 generation parallel loop total: %.3f ms, average: %.3f ms\n", c2_total / runs, c2_avg / runs
 	printf "Setup total: %.3f ms, average: %.3f ms\n", setup_total / runs, setup_avg / runs
+	printf "Truncation LUT build total: %.3f ms, average: %.3f ms\n", trunc_lut_build_total / runs, trunc_lut_build_avg / runs
+	printf "Softmax LUT build total: %.3f ms, average: %.3f ms\n", softmax_lut_build_total / runs, softmax_lut_build_avg / runs
 	printf "LUT build total: %.3f ms, average: %.3f ms\n", lut_total / runs, lut_avg / runs
+	printf "Truncation LUT cumulative size: %.6f MB\n", trunc_lut_size / runs
+	printf "Softmax LUT cumulative size: %.6f MB\n", softmax_lut_size / runs
 	printf "Cumulative LUT size: %.6f MB\n", lut_size / runs
 }
 ' "$benchmark_log"

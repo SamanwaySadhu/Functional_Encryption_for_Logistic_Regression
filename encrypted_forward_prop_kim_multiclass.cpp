@@ -27,16 +27,26 @@
 // own function-hiding IP-FE instance (independent Setup/KeyGen/Encrypt, so it has
 // its own OTP randomness r2[c], r3[c] hiding it as r2[c]*x_c + r3[c]).
 //
-// A single *combined* lookup table is then keyed jointly on all NUM_CLASSES
-// blinded logits, and every row returns, for each class c, an OTP-masked softmax
-// value z1[c]*softmax(x_c; x_0,x_1,x_2) + z4[c].
+// Two LUT stages glue the classes together:
 //
-// NOTE ON DOMAIN SIZE: because the LUT is now keyed on a NUM_CLASSES-tuple of
-// candidate logits, the number of rows that must be pre-computed grows as
-// O(range^NUM_CLASSES) instead of O(range). FEATURE_SIZE and QUANTIZATION_BITS
-// below are therefore kept intentionally small so the cubic table stays
-// tractable; scale them up only if you also scale down NUM_CLASSES or accept a
-// much longer LUT-build phase.
+//   Stage A (per class, per sample -- "truncation LUT"): maps this class's
+//   full-precision blinded logit r2[c]*x_c + r3[c] down to a freshly
+//   OTP-masked, small-domain TRUNCATED logit rT2[c]*trunc(x_c) + rT3[c],
+//   embedded as a single G1 element. This table has O(range) rows -- cheap,
+//   linear in the logit range.
+//
+//   Stage B (once per sample -- "softmax LUT"): keyed jointly on the
+//   NUM_CLASSES truncated G1 outputs of Stage A, and returns, for each class
+//   c, an OTP-masked softmax value z1[c]*softmax(trunc(x_c); trunc(x_0),
+//   trunc(x_1), trunc(x_2)) + z4[c].
+//
+// Why the split: a single combined LUT keyed directly on the NUM_CLASSES full-
+// precision logits costs O(range^NUM_CLASSES) rows -- cubic in the (wide)
+// logit range. By first collapsing each logit into a small TRUNC_OUTPUT_BITS-
+// wide bucket via three cheap linear-cost LUTs, the only cubic table left
+// (Stage B) is cubic in the much smaller truncated range instead, i.e.
+// O((1<<TRUNC_OUTPUT_BITS)^NUM_CLASSES) rows. Raising TRUNC_OUTPUT_BITS trades
+// softmax resolution for Stage B size; it has no effect on Stage A's cost.
 #define NUM_CLASSES 3
 #define FEATURE_SIZE 2
 #define NUM_SAMPLES 150
@@ -45,6 +55,15 @@
 #define QUANTIZATION_BITS 3
 #define MIN_X -(1 << (QUANTIZATION_BITS - 1))
 #define MAX_X (1 << (QUANTIZATION_BITS - 1)) - 1
+
+// The small domain each class's logit is squeezed into by Stage A before the
+// three classes are combined in Stage B. Stage B's cost is
+// O((1<<TRUNC_OUTPUT_BITS)^NUM_CLASSES), so this -- not FEATURE_SIZE or
+// QUANTIZATION_BITS -- is the knob that controls the size of the expensive
+// combined table.
+#define TRUNC_OUTPUT_BITS 4
+#define TRUNC_MIN (-(1 << (TRUNC_OUTPUT_BITS - 1)))
+#define TRUNC_MAX ((1 << (TRUNC_OUTPUT_BITS - 1)) - 1)
 
 long long total_decrypt_ms = 0;
 double total_lookup_us = 0.0;
@@ -92,10 +111,11 @@ struct ClassArtifacts {
     PublicKey pk;
     DecryptionKey sk;
     Ciphertext ct;
-    long r2 = 0;               // OTP scale hiding this class's logit
-    long r3 = 0;               // OTP offset hiding this class's logit
-    long expected_output = 0;  // r2 * output_value + r3
-    long output_value = 0;     // true (unblinded) logit w_c . x
+    EncryptedLookupTable trunc_lut;  // Stage A: this class's truncation LUT
+    long r2 = 0;                     // OTP scale hiding this class's full-precision logit
+    long r3 = 0;                     // OTP offset hiding this class's full-precision logit
+    long expected_output = 0;        // r2 * output_value + r3
+    long output_value = 0;           // true (unblinded) logit w_c . x
     bool has_pk = false;
     bool has_sk = false;
     bool has_ct = false;
@@ -103,14 +123,16 @@ struct ClassArtifacts {
 
 struct SampleArtifacts {
     ClassArtifacts classes[NUM_CLASSES];
-    EncryptedLookupTable lut; // jointly keyed on all NUM_CLASSES blinded logits
+    EncryptedLookupTable lut; // Stage B: jointly keyed softmax LUT for this sample
 };
 
 struct DecryptPhaseArtifacts {
     element_t D1[NUM_CLASSES];
     element_t D2[NUM_CLASSES];
+    element_t T[NUM_CLASSES]; // Stage A output: per-class truncated, OTP-masked G1 logit
     element_t L_in_G1[NUM_CLASSES][FEATURE_SIZE][BATCH_SIZE + 1];
     bool has_D = false;
+    bool has_T = false;
     bool has_L_in_G1 = false;
 };
 
@@ -354,43 +376,231 @@ long double softmax_prob(const long double logits[NUM_CLASSES], int c) {
     return std::exp(logits[c] - max_logit) / sum;
 }
 
-// Rescales the three raw (unblinded) integer logits the same way the single-class
-// scheme rescales its dot product before applying sigmoid, applies softmax, then
-// quantizes the resulting probability for class `c` back into the fixed-point domain.
-int non_linear_transform_softmax(int c, const long double raw_logits[NUM_CLASSES]) {
-    long double scaled[NUM_CLASSES];
+// Computes the quantized softmax output for class c given the ALREADY
+// TRUNCATED (small-domain, Stage A output) logits of all classes.
+int non_linear_transform_softmax(int c, const int trunc_logits[NUM_CLASSES]) {
+    long double logits[NUM_CLASSES];
     for (int i = 0; i < NUM_CLASSES; i++) {
-        scaled[i] = raw_logits[i] / (1 << (2 * QUANTIZATION_BITS - 2));
+        logits[i] = static_cast<long double>(trunc_logits[i]);
     }
-    long double prob = softmax_prob(scaled, c);
+    long double prob = softmax_prob(logits, c);
     return static_cast<int>(prob * (1 << (QUANTIZATION_BITS - 1)));
 }
 
-// Builds the joint lookup table for one sample. The table is keyed on the tuple of
-// NUM_CLASSES blinded logits (D2[0..NUM_CLASSES-1] at decrypt time), and each row's
-// plaintext holds, for every class c, the FEATURE_SIZE x (BATCH_SIZE+1) tensor of
-// G1 elements encoding z1[c] * softmax_c(x_0,x_1,x_2) + z4[c], exactly as the
-// single-class scheme encodes z1 * sigmoid(x) + z4, just replicated per class.
-EncryptedLookupTable BuildMulticlassEncryptedLookupTable(
+// Linearly rescales x (known to lie in [min_x, max_x]) down onto the small
+// [TRUNC_MIN, TRUNC_MAX] domain consumed by the softmax LUT (Stage B).
+int truncate_logit(int x, int min_x, int max_x) {
+    long double span = static_cast<long double>(max_x - min_x);
+    long double normalized = 0.0L;
+    if (span > 0.0L) {
+        normalized = (static_cast<long double>(x - min_x) / span) *
+                     static_cast<long double>(TRUNC_MAX - TRUNC_MIN);
+    }
+    long t = static_cast<long>(TRUNC_MIN) + std::llround(normalized);
+    if (t < TRUNC_MIN) t = TRUNC_MIN;
+    if (t > TRUNC_MAX) t = TRUNC_MAX;
+    return static_cast<int>(t);
+}
+
+// Stage A (per class, per sample): maps this class's raw, full-precision
+// blinded logit r2*x+r3 down to a freshly OTP-masked, small-domain truncated
+// logit rT2*trunc(x)+rT3, embedded as a single G1 element. The row is keyed
+// exactly like a single-class Kim-et-al. LUT (HKDF over the GT pairing value
+// that this class's real decryption will reproduce for logit x). Domain size
+// is O(max_x - min_x), i.e. linear in the logit range.
+EncryptedLookupTable BuildTruncationLUT(
         pairing_t pairing,
-        PublicKey pk[NUM_CLASSES],
+        PublicKey* pk,
         int min_x, int max_x,
-        long r3[NUM_CLASSES], long r2[NUM_CLASSES],
-        element_t alpha[NUM_CLASSES], element_t beta[NUM_CLASSES], element_t det_B[NUM_CLASSES],
-        int z1[NUM_CLASSES], int z4[NUM_CLASSES],
-        element_t betad[NUM_CLASSES][FEATURE_SIZE],
-        element_t Bstar[NUM_CLASSES][FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1],
-        int idx) {
+        long r2, long r3,
+        element_t alpha, element_t beta, element_t det_B,
+        long rT2, long rT3) {
     EncryptedLookupTable lut;
     lut.min_x = min_x;
     lut.max_x = max_x;
     lut.num_entries = 0;
     lut.table_size = 0;
 
+    std::vector<unsigned char> salt = {'G','T','2','G','1','-','T','R','U','N','C','-','S','A','L','T'};
+    std::vector<unsigned char> info = {'H','K','D','F','-','S','H','A','2','5','6','-','R','O','W'};
+
+    const size_t candidate_count = static_cast<size_t>(max_x - min_x + 1);
+    std::vector<LookupBuildEntry> entries;
+    entries.reserve(candidate_count);
+
+    int thread_count = 1;
+#ifdef _OPENMP
+    thread_count = omp_get_max_threads();
+#endif
+    std::vector<std::vector<LookupBuildEntry>> entries_by_thread(static_cast<size_t>(thread_count));
+
+#pragma omp parallel
+    {
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        std::vector<LookupBuildEntry>& local_entries = entries_by_thread[static_cast<size_t>(tid)];
+        local_entries.reserve((candidate_count / static_cast<size_t>(thread_count)) + 1);
+
+#pragma omp for schedule(static)
+        for (int x = min_x; x <= max_x; x++) {
+            element_t expt, gt_val;
+            element_init_Zr(expt, pairing);
+            element_init_GT(gt_val, pairing);
+
+            element_set_si(expt, r2 * x + r3);
+            element_mul(expt, expt, alpha);
+            element_mul(expt, expt, beta);
+            element_mul(expt, expt, det_B);
+            element_pow_zn(gt_val, pk->gT_base, expt);
+            std::vector<unsigned char> gt_bytes = serialize_element_to_bytes(gt_val);
+
+            int t = truncate_logit(x, min_x, max_x);
+
+            element_t out_exp, out_g1;
+            element_init_Zr(out_exp, pairing);
+            element_init_G1(out_g1, pairing);
+            element_set_si(out_exp, rT2 * t + rT3);
+            element_pow_zn(out_g1, pk->g1_base, out_exp);
+            std::vector<unsigned char> plaintext = serialize_g1_element_to_compressed_bytes(out_g1);
+            element_clear(out_exp);
+            element_clear(out_g1);
+
+            std::vector<unsigned char> key;
+            if (hkdf_sha256(gt_bytes, salt, info, HKDF_KEY_LEN, key)) {
+                EncryptedLookupRow row;
+                row.nonce.assign(GCM_NONCE_LEN, 0);
+                if (RAND_bytes(row.nonce.data(), row.nonce.size()) == 1 &&
+                    aes_gcm_encrypt(key, row.nonce, plaintext, row.ciphertext, row.tag)) {
+                    local_entries.push_back({std::move(row), std::move(key)});
+                }
+            }
+
+            element_clear(expt);
+            element_clear(gt_val);
+        }
+    }
+
+    for (auto& local_entries : entries_by_thread) {
+        if (!local_entries.empty()) {
+            entries.insert(entries.end(),
+                           std::make_move_iterator(local_entries.begin()),
+                           std::make_move_iterator(local_entries.end()));
+        }
+    }
+
+    if (!entries.empty()) {
+        size_t table_size = next_power_of_two(entries.size() * 2);
+        bool built = false;
+        for (int rebuild = 0; rebuild < LUT_MAX_REBUILDS; rebuild++) {
+            if (build_point_permute_cuckoo(entries, lut, table_size)) {
+                built = true;
+                break;
+            }
+            table_size <<= 1;
+        }
+        if (!built) {
+            lut.num_entries = 0;
+            lut.table_size = 0;
+            lut.slots.clear();
+            lut.occupied.clear();
+        }
+    }
+
+    return lut;
+}
+
+// Looks up a class's Stage-A truncation LUT using its real, decrypted GT
+// pairing value D2, and writes the recovered truncated G1 logit into `out_g1`
+// (which the caller must have already element_init_G1'd).
+bool MapGTtoTruncatedG1(pairing_t pairing,
+                        element_t D2,
+                        const EncryptedLookupTable& lut,
+                        element_t out_g1,
+                        bool verbose = true) {
+    std::vector<unsigned char> salt = {'G','T','2','G','1','-','T','R','U','N','C','-','S','A','L','T'};
+    std::vector<unsigned char> info = {'H','K','D','F','-','S','H','A','2','5','6','-','R','O','W'};
+
+    std::vector<unsigned char> d2_bytes = serialize_element_to_bytes(D2);
+    std::vector<unsigned char> key;
+    if (!hkdf_sha256(d2_bytes, salt, info, HKDF_KEY_LEN, key)) {
+        return false;
+    }
+
+    if (lut.table_size == 0 || lut.slots.empty() || lut.occupied.empty()) {
+        return false;
+    }
+
+    size_t idx1 = lut_hash_idx1(key, lut.table_size);
+    size_t idx2 = lut_hash_idx2(key, lut.table_size);
+    unsigned char permute = lut_permute_bit(key);
+    size_t candidates[2] = {
+        permute ? idx2 : idx1,
+        permute ? idx1 : idx2
+    };
+
+    for (size_t idx : candidates) {
+        if (idx >= lut.occupied.size() || !lut.occupied[idx]) {
+            continue;
+        }
+
+        const EncryptedLookupRow& row = lut.slots[idx];
+        std::vector<unsigned char> plaintext;
+        if (!aes_gcm_decrypt(key, row.nonce, row.ciphertext, row.tag, plaintext)) {
+            continue;
+        }
+        if (plaintext.empty()) {
+            continue;
+        }
+
+        element_t g1_probe;
+        element_init_G1(g1_probe, pairing);
+        int g1_comp_len = element_length_in_bytes_compressed(g1_probe);
+        element_clear(g1_probe);
+
+        if (plaintext.size() != static_cast<size_t>(g1_comp_len)) {
+            continue;
+        }
+
+        element_from_bytes_compressed(out_g1, const_cast<unsigned char*>(plaintext.data()));
+
+        if (verbose) {
+            printf("Truncation lookup completed with success\n");
+        }
+        return true;
+    }
+    if (verbose) {
+        printf("Truncation lookup completed with failure\n");
+    }
+    return false;
+}
+
+// Stage B (combined, once per sample): keyed on the tuple of NUM_CLASSES
+// truncated, OTP-masked G1 logits produced by Stage A. Because the domain is
+// now [TRUNC_MIN, TRUNC_MAX] instead of the full logit range, this table has
+// O((1<<TRUNC_OUTPUT_BITS)^NUM_CLASSES) rows instead of O(width^NUM_CLASSES).
+// The row payload is unchanged from before: for every class c, the
+// FEATURE_SIZE x (BATCH_SIZE+1) tensor of G1 elements encoding
+// z1[c] * softmax_c(trunc_0,trunc_1,trunc_2) + z4[c].
+EncryptedLookupTable BuildSoftmaxLUT(
+        pairing_t pairing,
+        element_t g1_base[NUM_CLASSES],
+        long rT2[NUM_CLASSES], long rT3[NUM_CLASSES],
+        int z1[NUM_CLASSES], int z4[NUM_CLASSES],
+        element_t betad[NUM_CLASSES][FEATURE_SIZE],
+        element_t Bstar[NUM_CLASSES][FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1],
+        int idx) {
+    EncryptedLookupTable lut;
+    lut.min_x = TRUNC_MIN;
+    lut.max_x = TRUNC_MAX;
+    lut.num_entries = 0;
+    lut.table_size = 0;
+
     std::vector<unsigned char> salt = {'G','T','2','G','1','-','L','U','T','-','M','C','-','S','A','L','T'};
     std::vector<unsigned char> info = {'H','K','D','F','-','S','H','A','2','5','6','-','R','O','W'};
 
-    const int width = max_x - min_x + 1;
+    const int width = TRUNC_MAX - TRUNC_MIN + 1;
     const size_t candidate_count = static_cast<size_t>(width) * static_cast<size_t>(width) * static_cast<size_t>(width);
     std::vector<LookupBuildEntry> entries;
     entries.reserve(candidate_count);
@@ -407,43 +617,32 @@ EncryptedLookupTable BuildMulticlassEncryptedLookupTable(
 #ifdef _OPENMP
         tid = omp_get_thread_num();
 #endif
-
         std::vector<LookupBuildEntry>& local_entries = entries_by_thread[static_cast<size_t>(tid)];
         local_entries.reserve((candidate_count / static_cast<size_t>(thread_count)) + 1);
 
         // Parallelize over the outer (class-0) candidate dimension; each thread
         // owns a full (width x width) slab of the (class-1, class-2) sub-grid.
 #pragma omp for schedule(static)
-        for (int x0 = min_x; x0 <= max_x; x0++) {
-            for (int x1 = min_x; x1 <= max_x; x1++) {
-                for (int x2 = min_x; x2 <= max_x; x2++) {
-                    int xs[NUM_CLASSES] = {x0, x1, x2};
-                    long double raw_logits[NUM_CLASSES] = {
-                        static_cast<long double>(x0),
-                        static_cast<long double>(x1),
-                        static_cast<long double>(x2)
-                    };
+        for (int t0 = TRUNC_MIN; t0 <= TRUNC_MAX; t0++) {
+            for (int t1 = TRUNC_MIN; t1 <= TRUNC_MAX; t1++) {
+                for (int t2 = TRUNC_MIN; t2 <= TRUNC_MAX; t2++) {
+                    int ts[NUM_CLASSES] = {t0, t1, t2};
 
-                    element_t expt, exp1[NUM_CLASSES], gt_val;
-                    element_init_Zr(expt, pairing);
-                    element_init_GT(gt_val, pairing);
+                    element_t row_exp, row_g1, exp1[NUM_CLASSES];
+                    element_init_Zr(row_exp, pairing);
+                    element_init_G1(row_g1, pairing);
                     for (int c = 0; c < NUM_CLASSES; c++) {
                         element_init_Zr(exp1[c], pairing);
                     }
 
                     std::vector<unsigned char> row_key_material;
-
                     for (int c = 0; c < NUM_CLASSES; c++) {
-                        element_set_si(expt, r2[c] * xs[c] + r3[c]);
-                        element_mul(expt, expt, alpha[c]);
-                        element_mul(expt, expt, beta[c]);
-                        element_mul(expt, expt, det_B[c]);
-                        element_pow_zn(gt_val, pk[c].gT_base, expt);
+                        element_set_si(row_exp, rT2[c] * ts[c] + rT3[c]);
+                        element_pow_zn(row_g1, g1_base[c], row_exp);
+                        std::vector<unsigned char> g1_bytes = serialize_g1_element_to_compressed_bytes(row_g1);
+                        row_key_material.insert(row_key_material.end(), g1_bytes.begin(), g1_bytes.end());
 
-                        std::vector<unsigned char> gt_bytes = serialize_element_to_bytes(gt_val);
-                        row_key_material.insert(row_key_material.end(), gt_bytes.begin(), gt_bytes.end());
-
-                        element_set_si(exp1[c], z1[c] * non_linear_transform_softmax(c, raw_logits) + z4[c]);
+                        element_set_si(exp1[c], z1[c] * non_linear_transform_softmax(c, ts) + z4[c]);
                     }
 
                     std::vector<unsigned char> plaintext;
@@ -459,7 +658,7 @@ EncryptedLookupTable BuildMulticlassEncryptedLookupTable(
                                             betad[c][feature_idx],
                                             Bstar[c][feature_idx][idx][batch_idx]);
                                 element_mul(slot_exp, base_exp, exp1[c]);
-                                element_pow_zn(slot_g1, pk[c].g1_base, slot_exp);
+                                element_pow_zn(slot_g1, g1_base[c], slot_exp);
 
                                 std::vector<unsigned char> slot_bytes =
                                     serialize_g1_element_to_compressed_bytes(slot_g1);
@@ -482,8 +681,8 @@ EncryptedLookupTable BuildMulticlassEncryptedLookupTable(
                         }
                     }
 
-                    element_clear(expt);
-                    element_clear(gt_val);
+                    element_clear(row_exp);
+                    element_clear(row_g1);
                     for (int c = 0; c < NUM_CLASSES; c++) {
                         element_clear(exp1[c]);
                     }
@@ -522,21 +721,21 @@ EncryptedLookupTable BuildMulticlassEncryptedLookupTable(
     return lut;
 }
 
-// Looks up the row jointly keyed by all NUM_CLASSES blinded pairing outputs D2[c],
-// and, on success, splits the decrypted plaintext back into NUM_CLASSES separate
-// FEATURE_SIZE x (BATCH_SIZE+1) tensors of G1 elements (one per class).
-bool MapCombinedGTtoG1WithEncryptedLUT(pairing_t pairing,
-                                       element_t D2[NUM_CLASSES],
-                                       const EncryptedLookupTable& lut,
-                                       element_t L_in_G1[NUM_CLASSES][FEATURE_SIZE][BATCH_SIZE + 1],
-                                       bool verbose = true) {
+// Looks up the row jointly keyed by all NUM_CLASSES Stage-A truncated G1
+// outputs T[c], and, on success, splits the decrypted plaintext back into
+// NUM_CLASSES separate FEATURE_SIZE x (BATCH_SIZE+1) tensors of G1 elements.
+bool MapCombinedTruncatedG1ToG1WithEncryptedLUT(pairing_t pairing,
+                                                element_t T[NUM_CLASSES],
+                                                const EncryptedLookupTable& lut,
+                                                element_t L_in_G1[NUM_CLASSES][FEATURE_SIZE][BATCH_SIZE + 1],
+                                                bool verbose = true) {
     std::vector<unsigned char> salt = {'G','T','2','G','1','-','L','U','T','-','M','C','-','S','A','L','T'};
     std::vector<unsigned char> info = {'H','K','D','F','-','S','H','A','2','5','6','-','R','O','W'};
 
     std::vector<unsigned char> row_key_material;
     for (int c = 0; c < NUM_CLASSES; c++) {
-        std::vector<unsigned char> d2_bytes = serialize_element_to_bytes(D2[c]);
-        row_key_material.insert(row_key_material.end(), d2_bytes.begin(), d2_bytes.end());
+        std::vector<unsigned char> t_bytes = serialize_g1_element_to_compressed_bytes(T[c]);
+        row_key_material.insert(row_key_material.end(), t_bytes.begin(), t_bytes.end());
     }
 
     std::vector<unsigned char> key;
@@ -598,12 +797,12 @@ bool MapCombinedGTtoG1WithEncryptedLUT(pairing_t pairing,
         }
 
         if (verbose) {
-            printf("Combined lookup completed with success\n");
+            printf("Combined softmax lookup completed with success\n");
         }
         return true;
     }
     if (verbose) {
-        printf("Combined lookup completed with failure\n");
+        printf("Combined softmax lookup completed with failure\n");
     }
     return false;
 }
@@ -997,6 +1196,7 @@ void ClearClassArtifacts(ClassArtifacts* cls) {
         ClearPublicKey(&cls->pk);
         cls->has_pk = false;
     }
+    cls->trunc_lut = EncryptedLookupTable();
 }
 
 void ClearSampleArtifacts(SampleArtifacts* sample) {
@@ -1016,6 +1216,12 @@ void ClearDecryptPhaseArtifacts(DecryptPhaseArtifacts* artifacts) {
             }
         }
         artifacts->has_L_in_G1 = false;
+    }
+    if (artifacts->has_T) {
+        for (int c = 0; c < NUM_CLASSES; c++) {
+            element_clear(artifacts->T[c]);
+        }
+        artifacts->has_T = false;
     }
     if (artifacts->has_D) {
         for (int c = 0; c < NUM_CLASSES; c++) {
@@ -1055,18 +1261,28 @@ int main() {
     pbc_param_clear(pbc_param);
 
     double total_setup_ms = 0.0;
-    double total_lut_build_ms = 0.0;
-    long double total_lut_size_bytes = 0.0L;
+    double total_trunc_lut_build_ms = 0.0;
+    double total_softmax_lut_build_ms = 0.0;
+    long double total_trunc_lut_size_bytes = 0.0L;
+    long double total_softmax_lut_size_bytes = 0.0L;
     long long total_keygen_us = 0;
     long long total_encrypt_us = 0;
     double decrypt_bilinear_parallel_ms = 0.0;
-    double decrypt_lookup_parallel_ms = 0.0;
+    double decrypt_trunc_lookup_parallel_ms = 0.0;
+    double decrypt_softmax_lookup_parallel_ms = 0.0;
     double c2_generation_parallel_ms = 0.0;
     bool failed = false;
     int failed_sample = -1;
     int failed_class = -1;
 
     std::vector<SampleArtifacts> samples(BATCH_SIZE);
+
+    // MIN_X has strictly larger magnitude than MAX_X (e.g. -4..3), so the
+    // largest achievable per-feature product w[i]*x[i] is MIN_X*MIN_X, not
+    // MAX_X*MAX_X. This is the full (pre-truncation) domain each class's
+    // Stage-A LUT is built over.
+    const int min_x = FEATURE_SIZE * MIN_X * MAX_X;
+    const int max_x = FEATURE_SIZE * MIN_X * MIN_X;
 
     // Softmax-output masking randomness, one scale/offset pair per class.
     int z1[NUM_CLASSES];
@@ -1131,8 +1347,9 @@ int main() {
     }
 
     // Phase 1: for every sample, run NUM_CLASSES independent Setup/KeyGen/Encrypt
-    // instances (one per class weight vector, sharing the same data point x), then
-    // build the single combined LUT for that sample.
+    // instances (one per class weight vector, sharing the same data point x),
+    // build each class's Stage-A truncation LUT, and finally build the single
+    // Stage-B combined softmax LUT for that sample.
     for (int sample = 0; sample < BATCH_SIZE && !failed; sample++) {
         SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
         auto sample_phase1_start = std::chrono::steady_clock::now();
@@ -1142,9 +1359,8 @@ int main() {
             x[i] = (i == FEATURE_SIZE - 1) ? MAX_X : generate_random_int(MIN_X, MAX_X);
         }
 
-        PublicKey pk_local[NUM_CLASSES];
-        element_t alpha_local[NUM_CLASSES], beta_local[NUM_CLASSES], det_B_local[NUM_CLASSES];
-        long r2_local[NUM_CLASSES], r3_local[NUM_CLASSES];
+        element_t g1_base_local[NUM_CLASSES];
+        long rT2_local[NUM_CLASSES], rT3_local[NUM_CLASSES];
 
         for (int c = 0; c < NUM_CLASSES && !failed; c++) {
             ClassArtifacts& cls = sample_data.classes[c];
@@ -1229,24 +1445,25 @@ int main() {
             cls.expected_output = expected_output;
             cls.output_value = output_value;
 
-            // Stash per-class randomness/pk/alpha/beta/det_B for the joint LUT build below.
-            element_init_G1(pk_local[c].g1, pairing);
-            element_set(pk_local[c].g1, cls.pk.g1);
-            element_init_G2(pk_local[c].g2, pairing);
-            element_set(pk_local[c].g2, cls.pk.g2);
-            element_init_GT(pk_local[c].gT_base, pairing);
-            element_set(pk_local[c].gT_base, cls.pk.gT_base);
-            element_init_G1(pk_local[c].g1_base, pairing);
-            element_set(pk_local[c].g1_base, cls.pk.g1_base);
+            // Stage A: build this class's truncation LUT right here, while
+            // alpha_sample/beta_sample/msk.det_B (this class's IPFE secret
+            // scalars) are still in scope.
+            long rT2 = generate_random_int(-(1 << 15), (1 << 15) - 1);
+            long rT3 = generate_random_int(-(1 << 15), (1 << 15) - 1);
 
-            element_init_Zr(alpha_local[c], pairing);
-            element_set(alpha_local[c], alpha_sample);
-            element_init_Zr(beta_local[c], pairing);
-            element_set(beta_local[c], beta_sample);
-            element_init_Zr(det_B_local[c], pairing);
-            element_set(det_B_local[c], msk.det_B);
-            r2_local[c] = r2;
-            r3_local[c] = r3;
+            auto trunc_start = std::chrono::steady_clock::now();
+            cls.trunc_lut = BuildTruncationLUT(pairing, &cls.pk, min_x, max_x, r2, r3,
+                                               alpha_sample, beta_sample, msk.det_B, rT2, rT3);
+            auto trunc_stop = std::chrono::steady_clock::now();
+            total_trunc_lut_build_ms += std::chrono::duration<double, std::milli>(trunc_stop - trunc_start).count();
+            total_trunc_lut_size_bytes += static_cast<long double>(estimate_lut_size_bytes(cls.trunc_lut));
+
+            rT2_local[c] = rT2;
+            rT3_local[c] = rT3;
+
+            // Stash this class's g1_base for the Stage-B softmax LUT build below.
+            element_init_G1(g1_base_local[c], pairing);
+            element_set(g1_base_local[c], cls.pk.g1_base);
 
             for (int i = 0; i < DIM_M; i++) {
                 element_clear(x_vec[i]);
@@ -1261,27 +1478,32 @@ int main() {
             break;
         }
 
-        // MIN_X has strictly larger magnitude than MAX_X (e.g. -4..3), so the largest
-        // achievable per-feature product w[i]*x[i] is MIN_X*MIN_X, not MAX_X*MAX_X.
-        // Using MAX_X*MAX_X as the upper bound leaves true logits above it with no
-        // corresponding LUT row, which is exactly what causes "Combined lookup failed".
-        int min_x = FEATURE_SIZE * MIN_X * MAX_X;
-        int max_x = FEATURE_SIZE * MIN_X * MIN_X;
+        if (sample == 0) {
+            EncryptedLookupTable& t_lut = sample_data.classes[0].trunc_lut;
+            size_t one_row_size_bytes = 0;
+            for (size_t idx = 0; idx < t_lut.table_size; idx++) {
+                if (idx < t_lut.occupied.size() && t_lut.occupied[idx]) {
+                    one_row_size_bytes = estimate_lut_row_size_bytes(t_lut.slots[idx]);
+                    break;
+                }
+            }
+            printf("\n=== Truncation LUT Stats (sample 0, class 0) ===\n");
+            printf("Total table size: %.6f MB\n", estimate_lut_size_bytes(t_lut) / (1024.0 * 1024.0));
+            printf("One row size: %zu bytes\n", one_row_size_bytes);
+            printf("Number of rows: %zu\n", t_lut.num_entries);
+        }
 
         int z4_sample[NUM_CLASSES];
         for (int c = 0; c < NUM_CLASSES; c++) {
             z4_sample[c] = z4[c][sample];
         }
 
-        auto lut_start = std::chrono::steady_clock::now();
-        sample_data.lut = BuildMulticlassEncryptedLookupTable(
-            pairing, pk_local, min_x, max_x, r3_local, r2_local,
-            alpha_local, beta_local, det_B_local, z1, z4_sample, betad, Bstar, sample);
-        auto lut_stop = std::chrono::steady_clock::now();
-        total_lut_build_ms += std::chrono::duration<double, std::milli>(lut_stop - lut_start).count();
-
-        size_t lut_size_bytes = estimate_lut_size_bytes(sample_data.lut);
-        total_lut_size_bytes += static_cast<long double>(lut_size_bytes);
+        auto softmax_start = std::chrono::steady_clock::now();
+        sample_data.lut = BuildSoftmaxLUT(pairing, g1_base_local, rT2_local, rT3_local,
+                                          z1, z4_sample, betad, Bstar, sample);
+        auto softmax_stop = std::chrono::steady_clock::now();
+        total_softmax_lut_build_ms += std::chrono::duration<double, std::milli>(softmax_stop - softmax_start).count();
+        total_softmax_lut_size_bytes += static_cast<long double>(estimate_lut_size_bytes(sample_data.lut));
 
         if (sample == 0) {
             size_t one_row_size_bytes = 0;
@@ -1292,20 +1514,14 @@ int main() {
                 }
             }
 
-            printf("\n=== Single Combined LUT Stats (sample 0) ===\n");
-            printf("Total table size: %.6f MB\n", lut_size_bytes / (1024.0 * 1024.0));
+            printf("\n=== Softmax LUT Stats (sample 0) ===\n");
+            printf("Total table size: %.6f MB\n", estimate_lut_size_bytes(sample_data.lut) / (1024.0 * 1024.0));
             printf("One row size: %zu bytes\n", one_row_size_bytes);
             printf("Number of rows: %zu\n", sample_data.lut.num_entries);
         }
 
         for (int c = 0; c < NUM_CLASSES; c++) {
-            element_clear(pk_local[c].g1);
-            element_clear(pk_local[c].g2);
-            element_clear(pk_local[c].gT_base);
-            element_clear(pk_local[c].g1_base);
-            element_clear(alpha_local[c]);
-            element_clear(beta_local[c]);
-            element_clear(det_B_local[c]);
+            element_clear(g1_base_local[c]);
         }
 
         auto sample_phase1_stop = std::chrono::steady_clock::now();
@@ -1317,6 +1533,8 @@ int main() {
         std::vector<DecryptPhaseArtifacts> decrypt_artifacts(static_cast<size_t>(BATCH_SIZE));
 
         // Phase 2.1: bilinear pairing operations, per sample per class, in parallel.
+        // Also pre-initialize the Stage-A output slots T[c] here so they are
+        // always safe to element_clear later, regardless of lookup outcome.
         auto bilinear_start = std::chrono::steady_clock::now();
 #pragma omp parallel for collapse(2) schedule(static)
         for (int sample = 0; sample < BATCH_SIZE; sample++) {
@@ -1327,6 +1545,7 @@ int main() {
 
                 element_init_GT(phase_data.D1[c], pairing);
                 element_init_GT(phase_data.D2[c], pairing);
+                element_init_G1(phase_data.T[c], pairing);
 
                 element_pairing(phase_data.D1[c], cls.sk.K1, cls.ct.C1);
 
@@ -1345,6 +1564,7 @@ int main() {
 
         for (int sample = 0; sample < BATCH_SIZE; sample++) {
             decrypt_artifacts[static_cast<size_t>(sample)].has_D = true;
+            decrypt_artifacts[static_cast<size_t>(sample)].has_T = true;
         }
 
         // Phase 2.2: per-class correctness check D1[c]^expected_output[c] == D2[c].
@@ -1373,8 +1593,40 @@ int main() {
             }
         }
 
-        // Phase 2.3: combined LUT lookup in parallel, one lookup per sample (jointly
-        // keyed on all NUM_CLASSES of that sample's D2 values).
+        // Phase 2.3a: Stage-A truncation lookups, per (sample, class), in parallel.
+        if (!failed) {
+            std::vector<int> trunc_status(static_cast<size_t>(BATCH_SIZE * NUM_CLASSES), 1);
+            auto trunc_lookup_start = std::chrono::steady_clock::now();
+
+#pragma omp parallel for collapse(2) schedule(static)
+            for (int sample = 0; sample < BATCH_SIZE; sample++) {
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
+                    DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
+                    if (!MapGTtoTruncatedG1(pairing, phase_data.D2[c], sample_data.classes[c].trunc_lut,
+                                            phase_data.T[c], false)) {
+                        trunc_status[static_cast<size_t>(sample) * NUM_CLASSES + static_cast<size_t>(c)] = 0;
+                    }
+                }
+            }
+
+            auto trunc_lookup_stop = std::chrono::steady_clock::now();
+            decrypt_trunc_lookup_parallel_ms = std::chrono::duration<double, std::milli>(trunc_lookup_stop - trunc_lookup_start).count();
+
+            for (int sample = 0; sample < BATCH_SIZE && !failed; sample++) {
+                for (int c = 0; c < NUM_CLASSES; c++) {
+                    if (trunc_status[static_cast<size_t>(sample) * NUM_CLASSES + static_cast<size_t>(c)] == 0) {
+                        printf("[ASSERTION FAILED] Truncation lookup failed at sample %d, class %d\n", sample, c);
+                        failed = true;
+                        failed_sample = sample;
+                        failed_class = c;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 2.3b: Stage-B combined softmax lookup, one per sample, in parallel.
         if (!failed) {
             std::vector<int> lookup_status(static_cast<size_t>(BATCH_SIZE), 1);
             auto lookup_start = std::chrono::steady_clock::now();
@@ -1383,11 +1635,11 @@ int main() {
             for (int sample = 0; sample < BATCH_SIZE; sample++) {
                 SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
                 DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
-                if (!MapCombinedGTtoG1WithEncryptedLUT(pairing,
-                                                       phase_data.D2,
-                                                       sample_data.lut,
-                                                       phase_data.L_in_G1,
-                                                       false)) {
+                if (!MapCombinedTruncatedG1ToG1WithEncryptedLUT(pairing,
+                                                                phase_data.T,
+                                                                sample_data.lut,
+                                                                phase_data.L_in_G1,
+                                                                false)) {
                     lookup_status[static_cast<size_t>(sample)] = 0;
                 } else {
                     phase_data.has_L_in_G1 = true;
@@ -1395,11 +1647,11 @@ int main() {
             }
 
             auto lookup_stop = std::chrono::steady_clock::now();
-            decrypt_lookup_parallel_ms = std::chrono::duration<double, std::milli>(lookup_stop - lookup_start).count();
+            decrypt_softmax_lookup_parallel_ms = std::chrono::duration<double, std::milli>(lookup_stop - lookup_start).count();
 
             for (int sample = 0; sample < BATCH_SIZE; sample++) {
                 if (lookup_status[static_cast<size_t>(sample)] == 0) {
-                    printf("[ASSERTION FAILED] Combined lookup failed at sample %d\n", sample);
+                    printf("[ASSERTION FAILED] Combined softmax lookup failed at sample %d\n", sample);
                     failed = true;
                     failed_sample = sample;
                     break;
@@ -1450,15 +1702,16 @@ int main() {
         }
 
         // Phase 2.5: final per-sample, per-class G1 comparison against the expected
-        // softmax-derived exponent.
+        // softmax-derived exponent, computed from the TRUNCATED logits (matching
+        // what Stage B actually embedded into the softmax LUT).
         if (!failed) {
             for (int sample = 0; sample < BATCH_SIZE && !failed; sample++) {
                 SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
                 DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
 
-                long double raw_logits[NUM_CLASSES];
+                int trunc_logits[NUM_CLASSES];
                 for (int c = 0; c < NUM_CLASSES; c++) {
-                    raw_logits[c] = static_cast<long double>(sample_data.classes[c].output_value);
+                    trunc_logits[c] = truncate_logit(sample_data.classes[c].output_value, min_x, max_x);
                 }
 
                 for (int c = 0; c < NUM_CLASSES && !failed; c++) {
@@ -1466,7 +1719,7 @@ int main() {
                     element_init_Zr(lut_exp, pairing);
                     element_init_Zr(expected_slot_exp, pairing);
                     element_init_G1(expected_L_in_G1, pairing);
-                    element_set_si(lut_exp, z1[c] * non_linear_transform_softmax(c, raw_logits) + z4[c][sample]);
+                    element_set_si(lut_exp, z1[c] * non_linear_transform_softmax(c, trunc_logits) + z4[c][sample]);
 
                     bool eq = true;
                     for (int feature_idx = 0; feature_idx < FEATURE_SIZE && eq; feature_idx++) {
@@ -1534,20 +1787,36 @@ int main() {
     printf("Decrypt bilinear parallel loop total: %.3f ms, average: %.3f ms\n",
             decrypt_bilinear_parallel_ms,
             decrypt_bilinear_parallel_ms / (BATCH_SIZE * NUM_CLASSES));
+    printf("Truncation lookup parallel loop total: %.3f ms, average: %.3f ms\n",
+            decrypt_trunc_lookup_parallel_ms,
+            decrypt_trunc_lookup_parallel_ms / (BATCH_SIZE * NUM_CLASSES));
+    printf("Softmax lookup parallel loop total: %.3f ms, average: %.3f ms\n",
+            decrypt_softmax_lookup_parallel_ms,
+            decrypt_softmax_lookup_parallel_ms / BATCH_SIZE);
     printf("Decrypt lookup parallel loop total: %.3f ms, average: %.3f ms\n",
-            decrypt_lookup_parallel_ms,
-            decrypt_lookup_parallel_ms / BATCH_SIZE);
+            decrypt_trunc_lookup_parallel_ms + decrypt_softmax_lookup_parallel_ms,
+            (decrypt_trunc_lookup_parallel_ms + decrypt_softmax_lookup_parallel_ms) / BATCH_SIZE);
     printf("C2 generation parallel loop total: %.3f ms, average: %.3f ms\n",
             c2_generation_parallel_ms,
             c2_generation_parallel_ms / (BATCH_SIZE * NUM_CLASSES));
     printf("Setup total: %.3f ms, average: %.3f ms\n",
             total_setup_ms,
             total_setup_ms / (BATCH_SIZE * NUM_CLASSES));
+    printf("Truncation LUT build total: %.3f ms, average: %.3f ms\n",
+            total_trunc_lut_build_ms,
+            total_trunc_lut_build_ms / (BATCH_SIZE * NUM_CLASSES));
+    printf("Softmax LUT build total: %.3f ms, average: %.3f ms\n",
+            total_softmax_lut_build_ms,
+            total_softmax_lut_build_ms / BATCH_SIZE);
     printf("LUT build total: %.3f ms, average: %.3f ms\n",
-            total_lut_build_ms,
-            total_lut_build_ms / BATCH_SIZE);
+            total_trunc_lut_build_ms + total_softmax_lut_build_ms,
+            (total_trunc_lut_build_ms + total_softmax_lut_build_ms) / BATCH_SIZE);
+    printf("Truncation LUT cumulative size: %.6Lf MB\n",
+            total_trunc_lut_size_bytes / (1024.0L * 1024.0L));
+    printf("Softmax LUT cumulative size: %.6Lf MB\n",
+            total_softmax_lut_size_bytes / (1024.0L * 1024.0L));
     printf("Cumulative LUT size: %.6Lf MB\n",
-            total_lut_size_bytes / (1024.0L * 1024.0L));
+            (total_trunc_lut_size_bytes + total_softmax_lut_size_bytes) / (1024.0L * 1024.0L));
 
     pairing_clear(pairing);
 
