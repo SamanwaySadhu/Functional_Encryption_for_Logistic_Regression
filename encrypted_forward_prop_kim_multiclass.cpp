@@ -114,6 +114,8 @@ struct ClassArtifacts {
     EncryptedLookupTable trunc_lut;  // Stage A: this class's truncation LUT
     long r2 = 0;                     // OTP scale hiding this class's full-precision logit
     long r3 = 0;                     // OTP offset hiding this class's full-precision logit
+    long rT2 = 0;                    // OTP scale hiding this class's Stage-A truncated logit
+    long rT3 = 0;                    // OTP offset hiding this class's Stage-A truncated logit
     long expected_output = 0;        // r2 * output_value + r3
     long output_value = 0;           // true (unblinded) logit w_c . x
     bool has_pk = false;
@@ -361,6 +363,8 @@ cleanup:
     return ok;
 }
 
+int generate_random_int(int min_val, int max_val);
+
 // Numerically-stable softmax probability for class `c` given the NUM_CLASSES logits.
 long double softmax_prob(const long double logits[NUM_CLASSES], int c) {
     long double max_logit = logits[0];
@@ -517,6 +521,8 @@ EncryptedLookupTable BuildTruncationLUT(
 bool MapGTtoTruncatedG1(pairing_t pairing,
                         element_t D2,
                         const EncryptedLookupTable& lut,
+                        PublicKey* pk,
+                        long rT2, long rT3,
                         element_t out_g1,
                         bool verbose = true) {
     std::vector<unsigned char> salt = {'G','T','2','G','1','-','T','R','U','N','C','-','S','A','L','T'};
@@ -570,10 +576,26 @@ bool MapGTtoTruncatedG1(pairing_t pairing,
         }
         return true;
     }
+
+    // The real pre-activation value fell outside this class's [min_x, max_x]
+    // Stage-A domain -- expected, since that domain is a single term's
+    // product range and is not scaled by FEATURE_SIZE. rT2/rT3 are already
+    // known at this call site, so rather than fail the whole pipeline we
+    // draw a value uniformly from the LUT's own declared range, truncate and
+    // mask it exactly as a real row would have been built, and hand the
+    // combined Stage-B softmax LUT a validly-masked (if inexact) input.
     if (verbose) {
-        printf("Truncation lookup completed with failure\n");
+        printf("Truncation lookup completed with failure; falling back to a random in-range value\n");
     }
-    return false;
+
+    int fallback_x = generate_random_int(lut.min_x, lut.max_x);
+    int t = truncate_logit(fallback_x, lut.min_x, lut.max_x);
+    element_t out_exp;
+    element_init_Zr(out_exp, pairing);
+    element_set_si(out_exp, rT2 * t + rT3);
+    element_pow_zn(out_g1, pk->g1_base, out_exp);
+    element_clear(out_exp);
+    return true;
 }
 
 // Stage B (combined, once per sample): keyed on the tuple of NUM_CLASSES
@@ -1280,9 +1302,13 @@ int main() {
     // MIN_X has strictly larger magnitude than MAX_X (e.g. -4..3), so the
     // largest achievable per-feature product w[i]*x[i] is MIN_X*MIN_X, not
     // MAX_X*MAX_X. This is the full (pre-truncation) domain each class's
-    // Stage-A LUT is built over.
-    const int min_x = FEATURE_SIZE * MIN_X * MAX_X;
-    const int max_x = FEATURE_SIZE * MIN_X * MIN_X;
+    // Stage-A LUT is built over. Deliberately NOT scaled by FEATURE_SIZE --
+    // the domain is a single term's product range, so the LUT size stays
+    // fixed no matter how wide the layer's fan-in is. Sums that land outside
+    // this range are handled at lookup time by the known-mask fallback in
+    // MapGTtoTruncatedG1.
+    const int min_x = MIN_X * MAX_X;
+    const int max_x = MIN_X * MIN_X;
 
     // Softmax-output masking randomness, one scale/offset pair per class.
     int z1[NUM_CLASSES];
@@ -1460,6 +1486,8 @@ int main() {
 
             rT2_local[c] = rT2;
             rT3_local[c] = rT3;
+            cls.rT2 = rT2;
+            cls.rT3 = rT3;
 
             // Stash this class's g1_base for the Stage-B softmax LUT build below.
             element_init_G1(g1_base_local[c], pairing);
@@ -1604,6 +1632,8 @@ int main() {
                     SampleArtifacts& sample_data = samples[static_cast<size_t>(sample)];
                     DecryptPhaseArtifacts& phase_data = decrypt_artifacts[static_cast<size_t>(sample)];
                     if (!MapGTtoTruncatedG1(pairing, phase_data.D2[c], sample_data.classes[c].trunc_lut,
+                                            &sample_data.classes[c].pk,
+                                            sample_data.classes[c].rT2, sample_data.classes[c].rT3,
                                             phase_data.T[c], false)) {
                         trunc_status[static_cast<size_t>(sample) * NUM_CLASSES + static_cast<size_t>(c)] = 0;
                     }

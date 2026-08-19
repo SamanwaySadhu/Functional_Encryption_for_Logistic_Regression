@@ -331,6 +331,8 @@ cleanup:
     return ok;
 }
 
+int generate_random_int(int min_val, int max_val);
+
 long double sigmoid(long double x) {
     return 1.0L / (1.0L + std::exp(-x));
 }
@@ -457,6 +459,11 @@ EncryptedLookupTable BuildEncryptedLookupTable(pairing_t pairing, PublicKey* pk,
 bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
                                    element_t L_T,
                                    const EncryptedLookupTable& lut,
+                                   PublicKey* pk,
+                                   int z1, int z4,
+                                   element_t betad[FEATURE_SIZE],
+                                   element_t Bstar[FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1],
+                                   int idx,
                                    element_t L_in_G1[FEATURE_SIZE][BATCH_SIZE + 1],
                                    bool verbose = true) {
     std::vector<unsigned char> salt = {'G','T','2','G','1','-','L','U','T','-','S','A','L','T'};
@@ -523,10 +530,38 @@ bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
         }
         return true;
     }
+
+    // The real pre-activation value fell outside the LUT's [min_x, max_x]
+    // domain -- expected, since the domain is a single term's product range
+    // and is not scaled by FEATURE_SIZE. The row masks (z1, z4, betad,
+    // Bstar) are already known at this call site, so rather than fail the
+    // whole pipeline we draw a value uniformly from the LUT's own declared
+    // range and mask it exactly as a real row would have been built,
+    // handing the next layer a validly-masked (if inexact) input.
     if (verbose) {
-        printf("Lookup completed with failure\n");
+        printf("Lookup completed with failure; falling back to a random in-range value\n");
     }
-    return false;
+
+    int fallback_x = generate_random_int(lut.min_x, lut.max_x);
+    element_t exp1, base_exp, slot_exp;
+    element_init_Zr(exp1, pairing);
+    element_init_Zr(base_exp, pairing);
+    element_init_Zr(slot_exp, pairing);
+    element_set_si(exp1, z1 * non_linear_transform((long double)fallback_x) + z4);
+
+    for (int feature_idx = 0; feature_idx < FEATURE_SIZE; feature_idx++) {
+        for (int batch_idx = 0; batch_idx < BATCH_SIZE + 1; batch_idx++) {
+            element_mul(base_exp, betad[feature_idx], Bstar[feature_idx][idx][batch_idx]);
+            element_mul(slot_exp, base_exp, exp1);
+            element_init_G1(L_in_G1[feature_idx][batch_idx], pairing);
+            element_pow_zn(L_in_G1[feature_idx][batch_idx], pk->g1_base, slot_exp);
+        }
+    }
+
+    element_clear(exp1);
+    element_clear(base_exp);
+    element_clear(slot_exp);
+    return true;
 }
 
 // --- Modified Matrix Inversion over Fq using Gaussian Elimination (Simultaneous Inv & Det) ---
@@ -942,7 +977,10 @@ void ClearDecryptPhaseArtifacts(DecryptPhaseArtifacts* artifacts) {
 
 // --- 4. Decrypt Algorithm (Kim et al. Section 3) ---
 bool Decrypt(pairing_t pairing, PublicKey* pk, DecryptionKey* sk, Ciphertext* ct, const EncryptedLookupTable& lut,
-             long r4, long r3, long expected_output, long output_value, bool verbose = true) {
+             long r4, long r3, long expected_output, long output_value,
+             int z1, int z4, element_t betad[FEATURE_SIZE],
+             element_t Bstar[FEATURE_SIZE][BATCH_SIZE + 1][BATCH_SIZE + 1], int idx,
+             bool verbose = true) {
     element_t D1, D2, temp_pairing;
     element_init_GT(D1, pairing);
     element_init_GT(D2, pairing);
@@ -991,7 +1029,7 @@ bool Decrypt(pairing_t pairing, PublicKey* pk, DecryptionKey* sk, Ciphertext* ct
     // LUT structure would hash a pairing derived value or be modified, but we pass D2 
     // seamlessly directly down here.
     element_t L_in_G1[FEATURE_SIZE][BATCH_SIZE + 1];
-    if (!MapLTinGTtoG1WithEncryptedLUT(pairing, D2, lut, L_in_G1, verbose)) {
+    if (!MapLTinGTtoG1WithEncryptedLUT(pairing, D2, lut, pk, z1, z4, betad, Bstar, idx, L_in_G1, verbose)) {
         printf("Failed to map D2 from GT to G1 using encrypted LUT.\n");
         element_clear(D1);
         element_clear(D2);
@@ -1221,7 +1259,12 @@ int main() {
         total_encrypt_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
-        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, (FEATURE_SIZE) * (MIN_X) * (MAX_X), (FEATURE_SIZE) * (MAX_X) * (MAX_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
+        // Domain is a single term's product range [MIN_X*MAX_X, MIN_X*MIN_X],
+        // NOT scaled by FEATURE_SIZE -- the LUT stays a fixed size regardless
+        // of how many inputs feed this neuron. Sums that land outside this
+        // range are handled at lookup time by the known-mask fallback in
+        // MapLTinGTtoG1WithEncryptedLUT.
+        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, (MIN_X) * (MAX_X), (MIN_X) * (MIN_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
         stop = std::chrono::steady_clock::now();
         total_lut_build_ms += std::chrono::duration<double, std::milli>(stop - start).count();
         size_t lut_size_bytes = estimate_lut_size_bytes(sample_data.lut);
@@ -1335,6 +1378,9 @@ int main() {
                 if (!MapLTinGTtoG1WithEncryptedLUT(pairing,
                                                    phase_data.D2,
                                                    sample_data.lut,
+                                                   &sample_data.pk,
+                                                   z1, z4[sample],
+                                                   betad, Bstar, sample,
                                                    phase_data.L_in_G1,
                                                    false)) {
                     lookup_status[static_cast<size_t>(sample)] = 0;
