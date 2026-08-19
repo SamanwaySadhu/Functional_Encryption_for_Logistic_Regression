@@ -1111,6 +1111,7 @@ int main() {
     double c2_generation_parallel_ms = 0.0;
     double decrypt_final_cmp_ms = 0.0;
     bool failed = false;
+    bool do_not_escape_on_assertion_failure = true;
     int failed_sample = -1;
 
     std::vector<SampleArtifacts> samples(BATCH_SIZE);
@@ -1479,7 +1480,9 @@ int main() {
                     printf("[ASSERTION FAILED] L_in_G1 mismatch at sample %d\n", sample);
                     failed = true;
                     failed_sample = sample;
-                    break;
+                    if (!do_not_escape_on_assertion_failure) {
+                        break;
+                    }
                 }
             }
         }
@@ -1501,7 +1504,7 @@ int main() {
         ClearSampleArtifacts(&samples[static_cast<size_t>(sample)]);
     }
 
-    if (failed) {
+    if (failed && !do_not_escape_on_assertion_failure) {
         printf("Pipeline failed at sample %d\n", failed_sample);
         pairing_clear(pairing);
         return 1;

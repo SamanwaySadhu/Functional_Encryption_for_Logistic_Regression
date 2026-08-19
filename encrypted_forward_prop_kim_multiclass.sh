@@ -7,7 +7,7 @@ g++ -O3 -std=c++17 -fopenmp encrypted_forward_prop_kim_multiclass.cpp -o encrypt
 benchmark_log=$(mktemp)
 trap 'rm -f "$benchmark_log"' EXIT
 
-for i in $(seq 1 3); do
+for i in $(seq 1 5); do
 	echo "======= Run $i ======="
 	{ time ./encrypted_forward_prop_kim_multiclass; } 2>&1 | tee -a "$benchmark_log"
 	echo
