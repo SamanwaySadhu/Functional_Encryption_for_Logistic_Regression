@@ -34,7 +34,7 @@
 // next stage, since a class's FEATURE_SIZE per-feature outputs get combined
 // (via Bstar's secret sharing) into that class's own next-stage ciphertext.
 #define NUM_CLASSES 3
-#define FEATURE_SIZE 5
+#define FEATURE_SIZE 17
 #define NUM_SAMPLES 150
 #define DIM_M (BATCH_SIZE + 1)
 #define LR 0.5L
@@ -1635,7 +1635,7 @@ int main() {
     // "w_scaled - trunc(output_values)" range) has the identical issue for the
     // same reason, so it is bounded symmetrically via -MIN_X as well.
     const int ebp_gtgt_min_x = BATCH_SIZE * MIN_X * MAX_X;
-    const int ebp_gtgt_max_x = BATCH_SIZE * MAX_X * (-MIN_X);
+    const int ebp_gtgt_max_x = BATCH_SIZE * MIN_X * MIN_X;
 
     const long double ebp_gtg1_k = (long double)BATCH_SIZE / (long double)LR + (long double)BATCH_SIZE;
     const int ebp_gtg1_bound = static_cast<int>(std::ceil(ebp_gtg1_k * static_cast<long double>(-MIN_X)));
