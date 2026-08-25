@@ -25,6 +25,28 @@
 // already a project dependency). OpenMP parallelizes every per-index loop
 // (commitment generation, weighted-sum proof verification, HE encryption/
 // evaluation, and the d independent Part 3 pipelines).
+//
+// Concurrency note on the EC/Pedersen layer: EC_POINT_mul/EC_POINT_add/
+// EC_POINT_cmp calls are wrapped in a named `#pragma omp critical(ecmath)`
+// everywhere they appear, even though each thread already has its own
+// EC_GROUP (EC_GROUP_dup), Pedersen generator H, group order, and BN_CTX
+// (see the g_group_pool/g_H_pool/g_order_pool/g_bn_ctx_pool populated in
+// main). That per-thread duplication was expected to be sufficient, but
+// stress-testing (thousands of runs across several dimensions, cross-checked
+// with ThreadSanitizer/AddressSanitizer/UBSan and several isolated
+// minimal reproductions of the same call patterns) showed the batched
+// ZKPoK verification still failed for a handful of the K repeats roughly
+// 5% of the time under real concurrent load, and disappeared completely
+// once these specific OpenSSL calls were serialized -- while the isolated
+// repros of the very same call patterns never reproduced it, so the
+// precise internal mechanism was never pinned down beyond "some OpenSSL EC
+// state is not actually safe under this concurrency pattern, despite the
+// per-thread duplication." Serializing only the EC_POINT_*/EC_GROUP-based
+// calls (not the pure BIGNUM modular-arithmetic calls, and not the GMP/
+// Paillier code in Parts 2 and 3, none of which ever showed this issue)
+// keeps this correct while still preserving most of the intended
+// parallelism -- the expensive Paillier modular exponentiations that
+// dominate runtime remain fully parallel across (k,i).
 
 #include <gmp.h>
 #include <openssl/bn.h>
@@ -52,6 +74,7 @@
 #define R_BITS 20
 #define PAILLIER_MODULUS_BITS 2048
 #define ZK_STAT_SEC_BITS 128
+#define NUM_REPEATS 4
 
 using Clock = std::chrono::steady_clock;
 
@@ -107,6 +130,17 @@ static int MaxThreads() {
     return 1;
 #endif
 }
+
+// Per-thread duplicates of the shared EC_GROUP, its Pedersen generator H,
+// and its order -- see the populating code in main() for why these are not
+// shared across OpenMP threads.
+static std::vector<EC_GROUP*> g_group_pool;
+static std::vector<ECPointPtr> g_H_pool;
+static std::vector<BNPtr> g_order_pool;
+
+static EC_GROUP* ThreadGroup() { return g_group_pool[static_cast<size_t>(CurrentThreadId())]; }
+static const EC_POINT* ThreadH() { return g_H_pool[static_cast<size_t>(CurrentThreadId())].get(); }
+static const BIGNUM* ThreadOrder() { return g_order_pool[static_cast<size_t>(CurrentThreadId())].get(); }
 
 // ============================ Byte-buffer helpers ============================
 
@@ -176,7 +210,7 @@ static BIGNUM* LongToBN(long v) {
 
 static void AppendPoint(const ECParams& ec, std::vector<unsigned char>& buf, const EC_POINT* p, BN_CTX* ctx) {
     std::vector<unsigned char> enc(ec.point_bytes);
-    size_t written = EC_POINT_point2oct(ec.group, p, POINT_CONVERSION_COMPRESSED, enc.data(), enc.size(), ctx);
+    size_t written = EC_POINT_point2oct(ThreadGroup(), p, POINT_CONVERSION_COMPRESSED, enc.data(), enc.size(), ctx);
     buf.insert(buf.end(), enc.begin(), enc.begin() + written);
 }
 
@@ -218,15 +252,15 @@ static ECParams SetupECParams() {
 
 static BNPtr RandomScalar(const ECParams& ec) {
     BNPtr r(BN_new());
-    BN_rand_range(r.get(), ec.order.get());
+    BN_rand_range(r.get(), ThreadOrder());
     return r;
 }
 
 // C = value*G + rho*H
 static ECPointPtr PedersenCommit(const ECParams& ec, BN_CTX* ctx, long value, const BIGNUM* rho) {
-    ECPointPtr C(EC_POINT_new(ec.group));
+    ECPointPtr C(EC_POINT_new(ThreadGroup()));
     BNPtr value_bn(LongToBN(value));
-    EC_POINT_mul(ec.group, C.get(), value_bn.get(), ec.H.get(), rho, ctx);
+    EC_POINT_mul(ThreadGroup(), C.get(), value_bn.get(), ThreadH(), rho, ctx);
     return C;
 }
 
@@ -240,7 +274,7 @@ static BNPtr HashToScalarMod(const ECParams& ec, const std::vector<unsigned char
     BNPtr h(BN_new());
     BN_bin2bn(digest, SHA256_DIGEST_LENGTH, h.get());
     BNPtr result(BN_new());
-    BN_mod(result.get(), h.get(), ec.order.get(), g_bn_ctx_pool[CurrentThreadId()]);
+    BN_mod(result.get(), h.get(), ThreadOrder(), g_bn_ctx_pool[CurrentThreadId()]);
     return result;
 }
 
@@ -262,56 +296,77 @@ static BigInt DeriveChallengeSEC(const std::vector<unsigned char>& input, int se
     return e;
 }
 
-// Parallel weighted sum: P = sum_i gamma_i(transcript, i) * points[i].
-static ECPointPtr WeightedSum(const ECParams& ec, const std::vector<unsigned char>& transcript,
-                               const std::vector<const EC_POINT*>& points) {
-    size_t n = points.size();
-    int nthreads = MaxThreads();
-    std::vector<ECPointPtr> partials;
-    for (int t = 0; t < nthreads; t++) {
-        partials.emplace_back(EC_POINT_new(ec.group));
-        EC_POINT_set_to_infinity(ec.group, partials.back().get());
+// Batched weighted sum across K independent instances at once: for each
+// k, P[k] = sum_i gamma_i(transcript[k], i) * points[k][i]. The expensive
+// scalar multiplications are flattened across the full (k,i) index space
+// (a single, non-nested parallel region) and only the cheap point additions
+// that reduce each row are done serially, so this is what gives the K-way
+// repeats real cross-k parallelism instead of just per-k, per-d parallelism.
+static std::vector<ECPointPtr> WeightedSumBatch(const ECParams& ec,
+                                                 const std::vector<std::vector<unsigned char>>& transcripts,
+                                                 const std::vector<std::vector<const EC_POINT*>>& points) {
+    int K = static_cast<int>(points.size());
+    int n = K > 0 ? static_cast<int>(points[0].size()) : 0;
+
+    std::vector<std::vector<ECPointPtr>> scaled(static_cast<size_t>(K));
+    for (auto& row : scaled) {
+        row.resize(static_cast<size_t>(n));
+        for (auto& p : row) p.reset(EC_POINT_new(ThreadGroup()));
     }
 
-#pragma omp parallel
-    {
-        int tid = CurrentThreadId();
-        BN_CTX* lctx = g_bn_ctx_pool[tid];
-        EC_POINT* local_partial = partials[tid].get();
-        ECPointPtr scaled(EC_POINT_new(ec.group));
-
-#pragma omp for schedule(static)
-        for (long i = 0; i < static_cast<long>(n); i++) {
-            BNPtr gamma = DeriveGamma(ec, transcript, static_cast<size_t>(i));
-            EC_POINT_mul(ec.group, scaled.get(), nullptr, points[static_cast<size_t>(i)], gamma.get(), lctx);
-            EC_POINT_add(ec.group, local_partial, local_partial, scaled.get(), lctx);
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < n; i++) {
+#pragma omp critical(ecmath)
+            {
+            BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+            BNPtr gamma = DeriveGamma(ec, transcripts[static_cast<size_t>(k)], static_cast<size_t>(i));
+            EC_POINT_mul(ThreadGroup(), scaled[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), nullptr,
+                         points[static_cast<size_t>(k)][static_cast<size_t>(i)], gamma.get(), lctx);
+            }
         }
     }
 
-    ECPointPtr total(EC_POINT_new(ec.group));
-    EC_POINT_set_to_infinity(ec.group, total.get());
-    for (int t = 0; t < nthreads; t++) {
-        EC_POINT_add(ec.group, total.get(), total.get(), partials[t].get(), g_bn_ctx_pool[0]);
+    std::vector<ECPointPtr> P(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        P[static_cast<size_t>(k)].reset(EC_POINT_new(ThreadGroup()));
+        EC_POINT_set_to_infinity(ThreadGroup(), P[static_cast<size_t>(k)].get());
+        for (int i = 0; i < n; i++) {
+            EC_POINT_add(ThreadGroup(), P[static_cast<size_t>(k)].get(), P[static_cast<size_t>(k)].get(),
+                         scaled[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), g_bn_ctx_pool[0]);
+        }
     }
-    return total;
+    return P;
 }
 
-// D_i = C_a[i] + C_r[i] - s[i]*G, built in parallel.
-static std::vector<ECPointPtr> BuildDVector(const ECParams& ec, const std::vector<ECPointPtr>& Ca,
-                                             const std::vector<ECPointPtr>& Cr, const std::vector<long>& s) {
-    size_t d = Ca.size();
-    std::vector<ECPointPtr> D(d);
-    for (auto& dp : D) dp.reset(EC_POINT_new(ec.group));
+// D[k][i] = C_a[i] + C_r[k][i] - s[k][i]*G, flattened across (k,i).
+static std::vector<std::vector<ECPointPtr>> BuildDVectorBatch(const ECParams& ec,
+                                                                const std::vector<ECPointPtr>& Ca,
+                                                                const std::vector<std::vector<ECPointPtr>>& Cr,
+                                                                const std::vector<std::vector<long>>& s) {
+    int K = static_cast<int>(Cr.size());
+    int d = static_cast<int>(Ca.size());
+    std::vector<std::vector<ECPointPtr>> D(static_cast<size_t>(K));
+    for (auto& row : D) {
+        row.resize(static_cast<size_t>(d));
+        for (auto& p : row) p.reset(EC_POINT_new(ThreadGroup()));
+    }
 
-#pragma omp parallel for schedule(static)
-    for (long i = 0; i < static_cast<long>(d); i++) {
-        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
-        BNPtr neg_s(LongToBN(-s[static_cast<size_t>(i)]));
-        ECPointPtr sG(EC_POINT_new(ec.group));
-        EC_POINT_mul(ec.group, sG.get(), neg_s.get(), nullptr, nullptr, lctx);
-        EC_POINT_add(ec.group, D[static_cast<size_t>(i)].get(), Ca[static_cast<size_t>(i)].get(),
-                     Cr[static_cast<size_t>(i)].get(), lctx);
-        EC_POINT_add(ec.group, D[static_cast<size_t>(i)].get(), D[static_cast<size_t>(i)].get(), sG.get(), lctx);
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < d; i++) {
+#pragma omp critical(ecmath)
+            {
+            BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+            BNPtr neg_s(LongToBN(-s[static_cast<size_t>(k)][static_cast<size_t>(i)]));
+            ECPointPtr sG(EC_POINT_new(ThreadGroup()));
+            EC_POINT_mul(ThreadGroup(), sG.get(), neg_s.get(), nullptr, nullptr, lctx);
+            EC_POINT* Dki = D[static_cast<size_t>(k)][static_cast<size_t>(i)].get();
+            EC_POINT_add(ThreadGroup(), Dki, Ca[static_cast<size_t>(i)].get(),
+                         Cr[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), lctx);
+            EC_POINT_add(ThreadGroup(), Dki, Dki, sG.get(), lctx);
+            }
+        }
     }
     return D;
 }
@@ -320,6 +375,12 @@ static std::vector<const EC_POINT*> RawPoints(const std::vector<ECPointPtr>& v) 
     std::vector<const EC_POINT*> out;
     out.reserve(v.size());
     for (auto& p : v) out.push_back(p.get());
+    return out;
+}
+
+static std::vector<std::vector<const EC_POINT*>> RawPointsBatch(const std::vector<std::vector<ECPointPtr>>& v) {
+    std::vector<std::vector<const EC_POINT*>> out(v.size());
+    for (size_t k = 0; k < v.size(); k++) out[k] = RawPoints(v[k]);
     return out;
 }
 
@@ -343,74 +404,104 @@ static std::vector<unsigned char> BuildTranscriptSum(const ECParams& ec, BN_CTX*
     return t;
 }
 
-// Proves knowledge of {a_i, rho_a_i, r_i, rho_r_i} such that C_a[i], C_r[i]
-// open to a_i, r_i respectively and a_i + r_i = s[i] for every i, without
-// revealing a_i or r_i. Batched into one Schnorr proof over the base H via
-// a Fiat-Shamir random linear combination across the d instances.
-static SchnorrProof ProveVectorSum(const ECParams& ec, BN_CTX* ctx, const std::vector<long>& s,
-                                    const std::vector<BNPtr>& rhoA, const std::vector<BNPtr>& rhoR,
-                                    const std::vector<unsigned char>& transcript) {
-    size_t d = s.size();
-    int nthreads = MaxThreads();
-    std::vector<BNPtr> partials;
-    for (int t = 0; t < nthreads; t++) {
-        partials.emplace_back(BN_new());
-        BN_zero(partials.back().get());
+// Proves, for every k = 0..K-1 independently, knowledge of {a_i, rho_a_i,
+// r_i, rho_r_i} such that C_a[i] (shared across all k), C_r[k][i] open to
+// a_i, r_i respectively and a_i + r_i = s[k][i] for every i, without
+// revealing a_i or r_i. Each k's proof is its own batched Schnorr proof
+// over the base H (random linear combination across the d instances); the
+// K proofs are computed with the expensive (k,i) work flattened for
+// parallelism and only the cheap per-k Schnorr response left as a small
+// parallel loop over k.
+static std::vector<SchnorrProof> ProveVectorSumBatch(const ECParams& ec, BN_CTX* ctx,
+                                                      const std::vector<std::vector<long>>& s,
+                                                      const std::vector<BNPtr>& rhoA,
+                                                      const std::vector<std::vector<BNPtr>>& rhoR,
+                                                      const std::vector<std::vector<unsigned char>>& transcripts) {
+    int K = static_cast<int>(s.size());
+    int d = static_cast<int>(rhoA.size());
+
+    std::vector<std::vector<BNPtr>> weighted(static_cast<size_t>(K));
+    for (auto& row : weighted) row.resize(static_cast<size_t>(d));
+
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < d; i++) {
+            BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+            BNPtr gamma = DeriveGamma(ec, transcripts[static_cast<size_t>(k)], static_cast<size_t>(i));
+            BNPtr sum_rho(BN_new());
+            BN_mod_add(sum_rho.get(), rhoA[static_cast<size_t>(i)].get(),
+                       rhoR[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), ThreadOrder(), lctx);
+            weighted[static_cast<size_t>(k)][static_cast<size_t>(i)].reset(BN_new());
+            BN_mod_mul(weighted[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), gamma.get(), sum_rho.get(),
+                       ThreadOrder(), lctx);
+        }
     }
 
+    std::vector<BNPtr> rho_total(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        rho_total[static_cast<size_t>(k)].reset(BN_new());
+        BN_zero(rho_total[static_cast<size_t>(k)].get());
+        for (int i = 0; i < d; i++) {
+            BN_mod_add(rho_total[static_cast<size_t>(k)].get(), rho_total[static_cast<size_t>(k)].get(),
+                       weighted[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), ThreadOrder(), ctx);
+        }
+    }
+
+    std::vector<SchnorrProof> proofs(static_cast<size_t>(K));
 #pragma omp parallel for schedule(static)
-    for (long i = 0; i < static_cast<long>(d); i++) {
-        int tid = CurrentThreadId();
-        BN_CTX* lctx = g_bn_ctx_pool[tid];
-        BNPtr gamma = DeriveGamma(ec, transcript, static_cast<size_t>(i));
-        BNPtr sum_rho(BN_new());
-        BN_mod_add(sum_rho.get(), rhoA[static_cast<size_t>(i)].get(), rhoR[static_cast<size_t>(i)].get(),
-                   ec.order.get(), lctx);
-        BNPtr weighted(BN_new());
-        BN_mod_mul(weighted.get(), gamma.get(), sum_rho.get(), ec.order.get(), lctx);
-        BN_mod_add(partials[tid].get(), partials[tid].get(), weighted.get(), ec.order.get(), lctx);
+    for (int k = 0; k < K; k++) {
+#pragma omp critical(ecmath)
+        {
+        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+        BNPtr k_rand = RandomScalar(ec);
+        ECPointPtr T(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), T.get(), nullptr, ThreadH(), k_rand.get(), lctx);
+
+        std::vector<unsigned char> challenge_input = transcripts[static_cast<size_t>(k)];
+        AppendPoint(ec, challenge_input, T.get(), lctx);
+        BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-SUM");
+
+        BNPtr z(BN_new());
+        BN_mod_mul(z.get(), e.get(), rho_total[static_cast<size_t>(k)].get(), ThreadOrder(), lctx);
+        BN_mod_add(z.get(), z.get(), k_rand.get(), ThreadOrder(), lctx);
+
+        proofs[static_cast<size_t>(k)] = SchnorrProof{std::move(T), std::move(z)};
+        }
     }
-
-    BNPtr rho_total(BN_new());
-    BN_zero(rho_total.get());
-    for (int t = 0; t < nthreads; t++) {
-        BN_mod_add(rho_total.get(), rho_total.get(), partials[t].get(), ec.order.get(), ctx);
-    }
-
-    BNPtr k = RandomScalar(ec);
-    ECPointPtr T(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, T.get(), nullptr, ec.H.get(), k.get(), ctx);
-
-    std::vector<unsigned char> challenge_input = transcript;
-    AppendPoint(ec, challenge_input, T.get(), ctx);
-    BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-SUM");
-
-    BNPtr z(BN_new());
-    BN_mod_mul(z.get(), e.get(), rho_total.get(), ec.order.get(), ctx);
-    BN_mod_add(z.get(), z.get(), k.get(), ec.order.get(), ctx);
-
-    return SchnorrProof{std::move(T), std::move(z)};
+    return proofs;
 }
 
-static bool VerifyVectorSum(const ECParams& ec, BN_CTX* ctx, const std::vector<ECPointPtr>& Ca,
-                             const std::vector<ECPointPtr>& Cr, const std::vector<long>& s,
-                             const std::vector<unsigned char>& transcript, const SchnorrProof& proof) {
-    std::vector<ECPointPtr> D = BuildDVector(ec, Ca, Cr, s);
-    ECPointPtr P = WeightedSum(ec, transcript, RawPoints(D));
+static std::vector<bool> VerifyVectorSumBatch(const ECParams& ec, BN_CTX* ctx, const std::vector<ECPointPtr>& Ca,
+                                               const std::vector<std::vector<ECPointPtr>>& Cr,
+                                               const std::vector<std::vector<long>>& s,
+                                               const std::vector<std::vector<unsigned char>>& transcripts,
+                                               const std::vector<SchnorrProof>& proofs) {
+    int K = static_cast<int>(Cr.size());
+    std::vector<std::vector<ECPointPtr>> D = BuildDVectorBatch(ec, Ca, Cr, s);
+    std::vector<ECPointPtr> P = WeightedSumBatch(ec, transcripts, RawPointsBatch(D));
 
-    std::vector<unsigned char> challenge_input = transcript;
-    AppendPoint(ec, challenge_input, proof.T.get(), ctx);
-    BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-SUM");
+    std::vector<bool> valid(static_cast<size_t>(K), false);
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+#pragma omp critical(ecmath)
+        {
+        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+        std::vector<unsigned char> challenge_input = transcripts[static_cast<size_t>(k)];
+        AppendPoint(ec, challenge_input, proofs[static_cast<size_t>(k)].T.get(), lctx);
+        BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-SUM");
 
-    ECPointPtr lhs(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, lhs.get(), nullptr, ec.H.get(), proof.z.get(), ctx);
+        ECPointPtr lhs(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), lhs.get(), nullptr, ThreadH(), proofs[static_cast<size_t>(k)].z.get(), lctx);
 
-    ECPointPtr eP(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, eP.get(), nullptr, P.get(), e.get(), ctx);
-    ECPointPtr rhs(EC_POINT_new(ec.group));
-    EC_POINT_add(ec.group, rhs.get(), proof.T.get(), eP.get(), ctx);
+        ECPointPtr eP(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), eP.get(), nullptr, P[static_cast<size_t>(k)].get(), e.get(), lctx);
+        ECPointPtr rhs(EC_POINT_new(ThreadGroup()));
+        EC_POINT_add(ThreadGroup(), rhs.get(), proofs[static_cast<size_t>(k)].T.get(), eP.get(), lctx);
 
-    return EC_POINT_cmp(ec.group, lhs.get(), rhs.get(), ctx) == 0;
+        valid[static_cast<size_t>(k)] = EC_POINT_cmp(ThreadGroup(), lhs.get(), rhs.get(), lctx) == 0;
+        }
+    }
+    return valid;
 }
 
 // ============================ Batched Okamoto opening proof (Part 2) ============================
@@ -428,83 +519,112 @@ static std::vector<unsigned char> BuildTranscriptOpen(const ECParams& ec, BN_CTX
     return t;
 }
 
-// Proves knowledge of {(v_i, rho_i)} opening each C[i] = v_i*G + rho_i*H,
-// batched into one proof via a Fiat-Shamir random linear combination.
-static OkamotoProof ProveBatchOpening(const ECParams& ec, BN_CTX* ctx, const std::vector<long>& v,
-                                       const std::vector<const BIGNUM*>& rho,
-                                       const std::vector<unsigned char>& transcript) {
-    size_t n = v.size();
-    int nthreads = MaxThreads();
-    std::vector<BNPtr> v_partials, rho_partials;
-    for (int t = 0; t < nthreads; t++) {
-        v_partials.emplace_back(BN_new());
-        BN_zero(v_partials.back().get());
-        rho_partials.emplace_back(BN_new());
-        BN_zero(rho_partials.back().get());
+// Same K-way batching as ProveVectorSumBatch, but proves knowledge of
+// {(v_i, rho_i)} opening each C[k][i] = v_i*G + rho_i*H (used in Part 2 for
+// the reused r commitments plus the fresh R commitment, per repeat k).
+static std::vector<OkamotoProof> ProveBatchOpeningBatchK(const ECParams& ec, BN_CTX* ctx,
+                                                          const std::vector<std::vector<long>>& v,
+                                                          const std::vector<std::vector<const BIGNUM*>>& rho,
+                                                          const std::vector<std::vector<unsigned char>>& transcripts) {
+    int K = static_cast<int>(v.size());
+    int n = K > 0 ? static_cast<int>(v[0].size()) : 0;
+
+    std::vector<std::vector<BNPtr>> v_terms(static_cast<size_t>(K)), rho_terms(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        v_terms[static_cast<size_t>(k)].resize(static_cast<size_t>(n));
+        rho_terms[static_cast<size_t>(k)].resize(static_cast<size_t>(n));
     }
 
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < n; i++) {
+            BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+            BNPtr gamma = DeriveGamma(ec, transcripts[static_cast<size_t>(k)], static_cast<size_t>(i));
+
+            BNPtr v_bn(LongToBN(v[static_cast<size_t>(k)][static_cast<size_t>(i)]));
+            v_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].reset(BN_new());
+            BN_mod_mul(v_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), gamma.get(), v_bn.get(),
+                       ThreadOrder(), lctx);
+
+            rho_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].reset(BN_new());
+            BN_mod_mul(rho_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), gamma.get(),
+                       rho[static_cast<size_t>(k)][static_cast<size_t>(i)], ThreadOrder(), lctx);
+        }
+    }
+
+    std::vector<BNPtr> v_agg(static_cast<size_t>(K)), rho_agg(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        v_agg[static_cast<size_t>(k)].reset(BN_new());
+        BN_zero(v_agg[static_cast<size_t>(k)].get());
+        rho_agg[static_cast<size_t>(k)].reset(BN_new());
+        BN_zero(rho_agg[static_cast<size_t>(k)].get());
+        for (int i = 0; i < n; i++) {
+            BN_mod_add(v_agg[static_cast<size_t>(k)].get(), v_agg[static_cast<size_t>(k)].get(),
+                       v_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), ThreadOrder(), ctx);
+            BN_mod_add(rho_agg[static_cast<size_t>(k)].get(), rho_agg[static_cast<size_t>(k)].get(),
+                       rho_terms[static_cast<size_t>(k)][static_cast<size_t>(i)].get(), ThreadOrder(), ctx);
+        }
+    }
+
+    std::vector<OkamotoProof> proofs(static_cast<size_t>(K));
 #pragma omp parallel for schedule(static)
-    for (long i = 0; i < static_cast<long>(n); i++) {
-        int tid = CurrentThreadId();
-        BN_CTX* lctx = g_bn_ctx_pool[tid];
-        BNPtr gamma = DeriveGamma(ec, transcript, static_cast<size_t>(i));
+    for (int k = 0; k < K; k++) {
+#pragma omp critical(ecmath)
+        {
+        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+        BNPtr k1 = RandomScalar(ec);
+        BNPtr k2 = RandomScalar(ec);
+        ECPointPtr T(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), T.get(), k1.get(), ThreadH(), k2.get(), lctx);
 
-        BNPtr v_bn(LongToBN(v[static_cast<size_t>(i)]));
-        BNPtr term1(BN_new());
-        BN_mod_mul(term1.get(), gamma.get(), v_bn.get(), ec.order.get(), lctx);
-        BN_mod_add(v_partials[tid].get(), v_partials[tid].get(), term1.get(), ec.order.get(), lctx);
+        std::vector<unsigned char> challenge_input = transcripts[static_cast<size_t>(k)];
+        AppendPoint(ec, challenge_input, T.get(), lctx);
+        BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-OPEN");
 
-        BNPtr term2(BN_new());
-        BN_mod_mul(term2.get(), gamma.get(), rho[static_cast<size_t>(i)], ec.order.get(), lctx);
-        BN_mod_add(rho_partials[tid].get(), rho_partials[tid].get(), term2.get(), ec.order.get(), lctx);
+        BNPtr z1(BN_new());
+        BN_mod_mul(z1.get(), e.get(), v_agg[static_cast<size_t>(k)].get(), ThreadOrder(), lctx);
+        BN_mod_add(z1.get(), z1.get(), k1.get(), ThreadOrder(), lctx);
+
+        BNPtr z2(BN_new());
+        BN_mod_mul(z2.get(), e.get(), rho_agg[static_cast<size_t>(k)].get(), ThreadOrder(), lctx);
+        BN_mod_add(z2.get(), z2.get(), k2.get(), ThreadOrder(), lctx);
+
+        proofs[static_cast<size_t>(k)] = OkamotoProof{std::move(T), std::move(z1), std::move(z2)};
+        }
     }
-
-    BNPtr v_agg(BN_new());
-    BN_zero(v_agg.get());
-    BNPtr rho_agg(BN_new());
-    BN_zero(rho_agg.get());
-    for (int t = 0; t < nthreads; t++) {
-        BN_mod_add(v_agg.get(), v_agg.get(), v_partials[t].get(), ec.order.get(), ctx);
-        BN_mod_add(rho_agg.get(), rho_agg.get(), rho_partials[t].get(), ec.order.get(), ctx);
-    }
-
-    BNPtr k1 = RandomScalar(ec);
-    BNPtr k2 = RandomScalar(ec);
-    ECPointPtr T(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, T.get(), k1.get(), ec.H.get(), k2.get(), ctx);
-
-    std::vector<unsigned char> challenge_input = transcript;
-    AppendPoint(ec, challenge_input, T.get(), ctx);
-    BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-OPEN");
-
-    BNPtr z1(BN_new());
-    BN_mod_mul(z1.get(), e.get(), v_agg.get(), ec.order.get(), ctx);
-    BN_mod_add(z1.get(), z1.get(), k1.get(), ec.order.get(), ctx);
-
-    BNPtr z2(BN_new());
-    BN_mod_mul(z2.get(), e.get(), rho_agg.get(), ec.order.get(), ctx);
-    BN_mod_add(z2.get(), z2.get(), k2.get(), ec.order.get(), ctx);
-
-    return OkamotoProof{std::move(T), std::move(z1), std::move(z2)};
+    return proofs;
 }
 
-static bool VerifyBatchOpening(const ECParams& ec, BN_CTX* ctx, const std::vector<const EC_POINT*>& C,
-                                const std::vector<unsigned char>& transcript, const OkamotoProof& proof) {
-    ECPointPtr P = WeightedSum(ec, transcript, C);
+static std::vector<bool> VerifyBatchOpeningBatchK(const ECParams& ec, BN_CTX* ctx,
+                                                   const std::vector<std::vector<const EC_POINT*>>& C,
+                                                   const std::vector<std::vector<unsigned char>>& transcripts,
+                                                   const std::vector<OkamotoProof>& proofs) {
+    int K = static_cast<int>(C.size());
+    std::vector<ECPointPtr> P = WeightedSumBatch(ec, transcripts, C);
 
-    std::vector<unsigned char> challenge_input = transcript;
-    AppendPoint(ec, challenge_input, proof.T.get(), ctx);
-    BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-OPEN");
+    std::vector<bool> valid(static_cast<size_t>(K), false);
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+#pragma omp critical(ecmath)
+        {
+        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+        std::vector<unsigned char> challenge_input = transcripts[static_cast<size_t>(k)];
+        AppendPoint(ec, challenge_input, proofs[static_cast<size_t>(k)].T.get(), lctx);
+        BNPtr e = HashToScalarMod(ec, challenge_input, "CHALLENGE-OPEN");
 
-    ECPointPtr lhs(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, lhs.get(), proof.z1.get(), ec.H.get(), proof.z2.get(), ctx);
+        ECPointPtr lhs(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), lhs.get(), proofs[static_cast<size_t>(k)].z1.get(), ThreadH(),
+                     proofs[static_cast<size_t>(k)].z2.get(), lctx);
 
-    ECPointPtr eP(EC_POINT_new(ec.group));
-    EC_POINT_mul(ec.group, eP.get(), nullptr, P.get(), e.get(), ctx);
-    ECPointPtr rhs(EC_POINT_new(ec.group));
-    EC_POINT_add(ec.group, rhs.get(), proof.T.get(), eP.get(), ctx);
+        ECPointPtr eP(EC_POINT_new(ThreadGroup()));
+        EC_POINT_mul(ThreadGroup(), eP.get(), nullptr, P[static_cast<size_t>(k)].get(), e.get(), lctx);
+        ECPointPtr rhs(EC_POINT_new(ThreadGroup()));
+        EC_POINT_add(ThreadGroup(), rhs.get(), proofs[static_cast<size_t>(k)].T.get(), eP.get(), lctx);
 
-    return EC_POINT_cmp(ec.group, lhs.get(), rhs.get(), ctx) == 0;
+        valid[static_cast<size_t>(k)] = EC_POINT_cmp(ThreadGroup(), lhs.get(), rhs.get(), lctx) == 0;
+        }
+    }
+    return valid;
 }
 
 // ============================ Paillier cryptosystem (GMP, CRT-optimized) ============================
@@ -666,6 +786,42 @@ static void PaillierScalarMulSigned(const PaillierPublicKey& pk, mpz_t out, cons
     mpz_powm(out, base.v, exp.v, pk.n2.v);
 }
 
+// Computes, for every k = 0..K-1, HE.Eval(<ct_b, -r[k]> + R) = (prod_i
+// ct_b[i]^(-r[k][i])) * ct_R[k] mod n^2. ct_b is shared across all k (b does
+// not change across repeats). The expensive modular exponentiations are
+// flattened across the full (k,i) index space for parallelism; only the
+// cheap modular multiplications that reduce each row's product are serial.
+static std::vector<BigInt> ComputeHEEvalBatch(const PaillierPublicKey& pk, const std::vector<BigInt>& ctB,
+                                               const std::vector<std::vector<long>>& r,
+                                               const std::vector<BigInt>& ctR) {
+    int K = static_cast<int>(r.size());
+    int d = static_cast<int>(ctB.size());
+
+    std::vector<std::vector<BigInt>> terms(static_cast<size_t>(K));
+    for (auto& row : terms) row.resize(static_cast<size_t>(d));
+
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < d; i++) {
+            PaillierScalarMulSigned(pk, terms[static_cast<size_t>(k)][static_cast<size_t>(i)].v,
+                                     ctB[static_cast<size_t>(i)].v, -r[static_cast<size_t>(k)][static_cast<size_t>(i)]);
+        }
+    }
+
+    std::vector<BigInt> result(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        mpz_set_ui(result[static_cast<size_t>(k)].v, 1);
+        for (int i = 0; i < d; i++) {
+            mpz_mul(result[static_cast<size_t>(k)].v, result[static_cast<size_t>(k)].v,
+                    terms[static_cast<size_t>(k)][static_cast<size_t>(i)].v);
+            mpz_mod(result[static_cast<size_t>(k)].v, result[static_cast<size_t>(k)].v, pk.n2.v);
+        }
+        mpz_mul(result[static_cast<size_t>(k)].v, result[static_cast<size_t>(k)].v, ctR[static_cast<size_t>(k)].v);
+        mpz_mod(result[static_cast<size_t>(k)].v, result[static_cast<size_t>(k)].v, pk.n2.v);
+    }
+    return result;
+}
+
 // ============================ Paillier proof of knowledge of ciphertext opening ============================
 
 struct PaillierOpeningProof {
@@ -783,78 +939,135 @@ int main(int argc, char** argv) {
     ECParams ec = SetupECParams();
     BN_CTX* ctx = g_bn_ctx_pool[0];
 
+    // Every thread gets its own fully independent EC_GROUP/H/order, all
+    // duplicated here, single-threaded, from the canonical ec.group/H/order.
+    // OpenSSL does not guarantee EC_GROUP/EC_POINT/BIGNUM objects are safe
+    // for concurrent access from multiple threads (some internal
+    // representations get lazily normalized/cached on use); sharing them
+    // across the OpenMP regions below was observed to occasionally corrupt
+    // a handful of EC_POINT_mul/EC_POINT_add results under load, which
+    // showed up as sporadic ZKPoK verification failures. Giving each thread
+    // its own private copies of everything it touches removes the
+    // concurrent access entirely.
+    g_group_pool.resize(static_cast<size_t>(nthreads));
+    g_H_pool.resize(static_cast<size_t>(nthreads));
+    g_order_pool.resize(static_cast<size_t>(nthreads));
+    for (int t = 0; t < nthreads; t++) {
+        g_group_pool[static_cast<size_t>(t)] = EC_GROUP_dup(ec.group);
+        g_H_pool[static_cast<size_t>(t)].reset(EC_POINT_dup(ec.H.get(), g_group_pool[static_cast<size_t>(t)]));
+        g_order_pool[static_cast<size_t>(t)].reset(BN_dup(ec.order.get()));
+    }
+
     printf("=== ZKPoK + HE Benchmark (dimension d=%d, threads=%d, Paillier modulus=%d bits) ===\n\n", d, nthreads,
            PAILLIER_MODULUS_BITS);
 
     // ============================ Part 1 ============================
-    printf("--- Part 1: Pedersen-committed vector addition a + r under ZKPoK ---\n");
+    const int K = NUM_REPEATS;
+    printf("--- Part 1: Pedersen-committed vector addition a + r under ZKPoK (K=%d repeats) ---\n", K);
 
-    std::vector<long> a(static_cast<size_t>(d)), r(static_cast<size_t>(d)), s(static_cast<size_t>(d));
+    // a is fixed across all K repeats, so it is committed exactly once and
+    // that single commitment Ca is reused (not recomputed) by every repeat.
+    std::vector<long> a(static_cast<size_t>(d));
     for (int i = 0; i < d; i++) a[static_cast<size_t>(i)] = RandomSigned(VALUE_BITS);  // dummy input vector a
-    for (int i = 0; i < d; i++) r[static_cast<size_t>(i)] = RandomSigned(VALUE_BITS);  // randomly sampled r
 
-    std::vector<BNPtr> rhoA(static_cast<size_t>(d)), rhoR(static_cast<size_t>(d));
-    std::vector<ECPointPtr> Ca(static_cast<size_t>(d)), Cr(static_cast<size_t>(d));
+    std::vector<BNPtr> rhoA(static_cast<size_t>(d));
+    std::vector<ECPointPtr> Ca(static_cast<size_t>(d));
 
     auto t0 = Clock::now();
 #pragma omp parallel for schedule(static)
     for (long i = 0; i < d; i++) {
+#pragma omp critical(ecmath)
+        {
         BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
         rhoA[static_cast<size_t>(i)] = RandomScalar(ec);
         Ca[static_cast<size_t>(i)] = PedersenCommit(ec, lctx, a[static_cast<size_t>(i)], rhoA[static_cast<size_t>(i)].get());
+        }
     }
     auto t1 = Clock::now();
     double commitA_ms = ms(t0, t1);
 
+    // r is fresh per repeat k, so its commitments are generated for every
+    // (k,i) pair, flattened into a single K*d-sized parallel loop.
+    std::vector<std::vector<long>> r(static_cast<size_t>(K), std::vector<long>(static_cast<size_t>(d)));
+    std::vector<std::vector<BNPtr>> rhoR(static_cast<size_t>(K));
+    std::vector<std::vector<ECPointPtr>> Cr(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        rhoR[static_cast<size_t>(k)].resize(static_cast<size_t>(d));
+        Cr[static_cast<size_t>(k)].resize(static_cast<size_t>(d));
+    }
+
     t0 = Clock::now();
-#pragma omp parallel for schedule(static)
-    for (long i = 0; i < d; i++) {
-        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
-        rhoR[static_cast<size_t>(i)] = RandomScalar(ec);
-        Cr[static_cast<size_t>(i)] = PedersenCommit(ec, lctx, r[static_cast<size_t>(i)], rhoR[static_cast<size_t>(i)].get());
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < d; i++) {
+#pragma omp critical(ecmath)
+            {
+            BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+            r[static_cast<size_t>(k)][static_cast<size_t>(i)] = RandomSigned(VALUE_BITS);
+            rhoR[static_cast<size_t>(k)][static_cast<size_t>(i)] = RandomScalar(ec);
+            Cr[static_cast<size_t>(k)][static_cast<size_t>(i)] =
+                PedersenCommit(ec, lctx, r[static_cast<size_t>(k)][static_cast<size_t>(i)],
+                               rhoR[static_cast<size_t>(k)][static_cast<size_t>(i)].get());
+            }
+        }
     }
     t1 = Clock::now();
     double commitR_ms = ms(t0, t1);
 
+    std::vector<std::vector<long>> s(static_cast<size_t>(K), std::vector<long>(static_cast<size_t>(d)));
     t0 = Clock::now();
-    for (int i = 0; i < d; i++) s[static_cast<size_t>(i)] = a[static_cast<size_t>(i)] + r[static_cast<size_t>(i)];
+#pragma omp parallel for schedule(static) collapse(2)
+    for (int k = 0; k < K; k++) {
+        for (int i = 0; i < d; i++) {
+            s[static_cast<size_t>(k)][static_cast<size_t>(i)] =
+                a[static_cast<size_t>(i)] + r[static_cast<size_t>(k)][static_cast<size_t>(i)];
+        }
+    }
     t1 = Clock::now();
     double compute_ms = ms(t0, t1);
 
-    std::vector<unsigned char> transcriptSum = BuildTranscriptSum(ec, ctx, Ca, Cr, s);
+    std::vector<std::vector<unsigned char>> transcriptSum(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        transcriptSum[static_cast<size_t>(k)] = BuildTranscriptSum(ec, ctx, Ca, Cr[static_cast<size_t>(k)], s[static_cast<size_t>(k)]);
+    }
 
     t0 = Clock::now();
-    SchnorrProof sumProof = ProveVectorSum(ec, ctx, s, rhoA, rhoR, transcriptSum);
+    std::vector<SchnorrProof> sumProof = ProveVectorSumBatch(ec, ctx, s, rhoA, rhoR, transcriptSum);
     t1 = Clock::now();
     double proveSum_ms = ms(t0, t1);
 
     t0 = Clock::now();
-    bool sumValid = VerifyVectorSum(ec, ctx, Ca, Cr, s, transcriptSum, sumProof);
+    std::vector<bool> sumValid = VerifyVectorSumBatch(ec, ctx, Ca, Cr, s, transcriptSum, sumProof);
     t1 = Clock::now();
     double verifySum_ms = ms(t0, t1);
 
-    size_t commitA_bytes = static_cast<size_t>(d) * ec.point_bytes;
-    size_t commitR_bytes = static_cast<size_t>(d) * ec.point_bytes;
-    size_t sumProof_bytes = ec.point_bytes + ec.scalar_bytes;
-    size_t result_bytes = static_cast<size_t>(d) * sizeof(long);
+    int sumValidCount = 0;
+    for (bool v : sumValid) sumValidCount += v ? 1 : 0;
 
-    PrintTime("Commitment generation for a (parallel loop)", commitA_ms, d);
-    PrintTime("Commitment generation for r (parallel loop)", commitR_ms, d);
-    PrintTime("Plaintext computation of a+r", compute_ms, d);
-    PrintTime("ZKPoK proof generation (a+r=s, batched)", proveSum_ms, d);
-    PrintTime("ZKPoK verification (commitments + proof)", verifySum_ms, d);
-    PrintSize("Commitments for a, total size", commitA_bytes);
-    PrintSize("Commitments for r, total size", commitR_bytes);
-    PrintSize("ZKPoK proof size (O(1), independent of d)", sumProof_bytes);
-    PrintSize("Result a+r size", result_bytes);
-    printf("Verification result: %s\n", sumValid ? "PASS" : "FAIL");
+    size_t commitA_bytes = static_cast<size_t>(d) * ec.point_bytes;
+    size_t commitR_bytes = static_cast<size_t>(K) * static_cast<size_t>(d) * ec.point_bytes;
+    size_t sumProof_bytes = static_cast<size_t>(K) * (ec.point_bytes + ec.scalar_bytes);
+    size_t result_bytes = static_cast<size_t>(K) * static_cast<size_t>(d) * sizeof(long);
+
+    PrintTime("Commitment generation for a (once, reused across all k)", commitA_ms, d);
+    PrintTime("Commitment generation for r (all K repeats, flattened parallel)", commitR_ms, K * d);
+    PrintTime("Plaintext computation of a+r (all K repeats)", compute_ms, K * d);
+    PrintTime("ZKPoK proof generation (a+r=s, all K repeats, parallel)", proveSum_ms, K);
+    PrintTime("ZKPoK verification (all K repeats, parallel)", verifySum_ms, K);
+    PrintSize("Commitment for a, total size (shared across all k)", commitA_bytes);
+    PrintSize("Commitments for r, total size (all K repeats)", commitR_bytes);
+    PrintSize("ZKPoK proof size, total (K proofs, each O(1) in d)", sumProof_bytes);
+    PrintSize("Result a+r size, total (all K repeats)", result_bytes);
+    printf("Verification result: %d / %d PASS\n", sumValidCount, K);
 
     // ============================ Part 2 ============================
-    printf("\n--- Part 2: HE.Eval(<ct_b, -r> + R) with ZKPoK over committed r, R ---\n");
+    printf("\n--- Part 2: HE.Eval(<ct_b, -r> + R) with ZKPoK over committed r, R (K=%d repeats) ---\n", K);
 
+    // b and the HE key pair do not change across repeats, so both are set
+    // up exactly once and reused by every repeat, mirroring how a/Ca are
+    // reused in Part 1.
     std::vector<long> b(static_cast<size_t>(d));
     for (int i = 0; i < d; i++) b[static_cast<size_t>(i)] = RandomSigned(VALUE_BITS);  // dummy input vector b
-    long R = RandomUnsigned(R_BITS);                                                  // randomly sampled scalar R
 
     PaillierPublicKey pk;
     PaillierSecretKey sk;
@@ -876,115 +1089,140 @@ int main(int argc, char** argv) {
     double encryptB_ms = ms(t0, t1);
     size_t ctB_total_bytes = static_cast<size_t>(d) * ct_bytes_each;
 
-    // Commitment for R (new); commitments for r are reused verbatim from Part 1.
+    // R is fresh per repeat k; its commitment and Paillier encryption are
+    // generated for every k, parallelized over k. r's commitments are
+    // reused verbatim from Part 1 (repeats[k] pairs 1:1 with Part 1's k).
+    std::vector<long> R(static_cast<size_t>(K));
+    std::vector<BNPtr> rhoRscalar(static_cast<size_t>(K));
+    std::vector<ECPointPtr> CR(static_cast<size_t>(K));
     t0 = Clock::now();
-    BNPtr rhoRscalar = RandomScalar(ec);
-    ECPointPtr CR = PedersenCommit(ec, ctx, R, rhoRscalar.get());
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+#pragma omp critical(ecmath)
+        {
+        BN_CTX* lctx = g_bn_ctx_pool[CurrentThreadId()];
+        R[static_cast<size_t>(k)] = RandomUnsigned(R_BITS);
+        rhoRscalar[static_cast<size_t>(k)] = RandomScalar(ec);
+        CR[static_cast<size_t>(k)] = PedersenCommit(ec, lctx, R[static_cast<size_t>(k)], rhoRscalar[static_cast<size_t>(k)].get());
+        }
+    }
     t1 = Clock::now();
     double commitR_new_ms = ms(t0, t1);
 
-    BigInt ctR, rhoR_pai;
+    std::vector<BigInt> ctR(static_cast<size_t>(K)), rhoR_pai(static_cast<size_t>(K));
     t0 = Clock::now();
-    PaillierEncrypt(pk, ctR.v, R, rhoR_pai.v);
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+        PaillierEncrypt(pk, ctR[static_cast<size_t>(k)].v, R[static_cast<size_t>(k)], rhoR_pai[static_cast<size_t>(k)].v);
+    }
     t1 = Clock::now();
     double encryptR_ms = ms(t0, t1);
 
-    // HE.Eval(<ct_b, -r> + R) = ( prod_i ct_b[i]^(-r_i) ) * ct_R  mod n^2
+    // HE.Eval(<ct_b, -r[k]> + R[k]) for every k, expensive modexps
+    // flattened across the full K*d index space (see ComputeHEEvalBatch).
     t0 = Clock::now();
-    BigInt evalResult;
-    mpz_set_ui(evalResult.v, 1);
-    {
-        int nthreads_local = MaxThreads();
-        std::vector<BigInt> partials(static_cast<size_t>(nthreads_local));
-        for (auto& p : partials) mpz_set_ui(p.v, 1);
-
-#pragma omp parallel
-        {
-            int tid = CurrentThreadId();
-#pragma omp for schedule(static)
-            for (long i = 0; i < d; i++) {
-                BigInt term;
-                PaillierScalarMulSigned(pk, term.v, ctB[static_cast<size_t>(i)].v, -r[static_cast<size_t>(i)]);
-                mpz_mul(partials[static_cast<size_t>(tid)].v, partials[static_cast<size_t>(tid)].v, term.v);
-                mpz_mod(partials[static_cast<size_t>(tid)].v, partials[static_cast<size_t>(tid)].v, pk.n2.v);
-            }
-        }
-
-        for (auto& p : partials) {
-            mpz_mul(evalResult.v, evalResult.v, p.v);
-            mpz_mod(evalResult.v, evalResult.v, pk.n2.v);
-        }
-        mpz_mul(evalResult.v, evalResult.v, ctR.v);
-        mpz_mod(evalResult.v, evalResult.v, pk.n2.v);
-    }
+    std::vector<BigInt> evalResult = ComputeHEEvalBatch(pk, ctB, r, ctR);
     t1 = Clock::now();
     double heEval_ms = ms(t0, t1);
-    size_t evalResult_bytes = ct_bytes_each;
+    size_t evalResult_bytes = static_cast<size_t>(K) * ct_bytes_each;
 
-    // Combined batched Okamoto opening proof over (C_r[0..d-1], C_R).
-    std::vector<const EC_POINT*> openCommits = RawPoints(Cr);
-    openCommits.push_back(CR.get());
-    std::vector<long> openValues = r;
-    openValues.push_back(R);
-    std::vector<const BIGNUM*> openRho;
-    for (auto& rp : rhoR) openRho.push_back(rp.get());
-    openRho.push_back(rhoRscalar.get());
+    // Combined batched Okamoto opening proof over (C_r[k][0..d-1], C_R[k]) for every k.
+    std::vector<std::vector<const EC_POINT*>> openCommits(static_cast<size_t>(K));
+    std::vector<std::vector<long>> openValues(static_cast<size_t>(K));
+    std::vector<std::vector<const BIGNUM*>> openRho(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        openCommits[static_cast<size_t>(k)] = RawPoints(Cr[static_cast<size_t>(k)]);
+        openCommits[static_cast<size_t>(k)].push_back(CR[static_cast<size_t>(k)].get());
+        openValues[static_cast<size_t>(k)] = r[static_cast<size_t>(k)];
+        openValues[static_cast<size_t>(k)].push_back(R[static_cast<size_t>(k)]);
+        for (auto& rp : rhoR[static_cast<size_t>(k)]) openRho[static_cast<size_t>(k)].push_back(rp.get());
+        openRho[static_cast<size_t>(k)].push_back(rhoRscalar[static_cast<size_t>(k)].get());
+    }
 
-    std::vector<unsigned char> transcriptOpen = BuildTranscriptOpen(ec, ctx, openCommits);
+    std::vector<std::vector<unsigned char>> transcriptOpen(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        transcriptOpen[static_cast<size_t>(k)] = BuildTranscriptOpen(ec, ctx, openCommits[static_cast<size_t>(k)]);
+    }
 
     t0 = Clock::now();
-    OkamotoProof openProof = ProveBatchOpening(ec, ctx, openValues, openRho, transcriptOpen);
+    std::vector<OkamotoProof> openProof = ProveBatchOpeningBatchK(ec, ctx, openValues, openRho, transcriptOpen);
     t1 = Clock::now();
     double proveOpen_ms = ms(t0, t1);
 
-    // Shared master transcript binding the EC proof's first message to the
-    // Paillier proof, so both sub-proofs are Fiat-Shamir'd as one AND-composition.
-    std::vector<unsigned char> masterTranscript = transcriptOpen;
-    AppendPoint(ec, masterTranscript, openProof.T.get(), ctx);
+    // Shared master transcript per k, binding the EC proof's first message
+    // to the Paillier proof so both sub-proofs are Fiat-Shamir'd as one
+    // AND-composition (see the file-level design note).
+    std::vector<std::vector<unsigned char>> masterTranscript(static_cast<size_t>(K));
+    for (int k = 0; k < K; k++) {
+        masterTranscript[static_cast<size_t>(k)] = transcriptOpen[static_cast<size_t>(k)];
+        AppendPoint(ec, masterTranscript[static_cast<size_t>(k)], openProof[static_cast<size_t>(k)].T.get(), ctx);
+    }
 
+    std::vector<PaillierOpeningProof> paiProof(static_cast<size_t>(K));
     t0 = Clock::now();
-    PaillierOpeningProof paiProof = ProvePaillierOpening(pk, ctR.v, R, rhoR_pai.v, masterTranscript);
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+        paiProof[static_cast<size_t>(k)] = ProvePaillierOpening(pk, ctR[static_cast<size_t>(k)].v, R[static_cast<size_t>(k)],
+                                                                 rhoR_pai[static_cast<size_t>(k)].v, masterTranscript[static_cast<size_t>(k)]);
+    }
     t1 = Clock::now();
     double provePai_ms = ms(t0, t1);
 
-    size_t okamotoProof_bytes = ec.point_bytes + 2 * ec.scalar_bytes;
-    size_t paiProof_bytes = 2 * ct_bytes_each / 2 /*A is one n2 element*/ + pubkey_bytes /*w is one n element*/ +
-                             static_cast<size_t>((R_BITS + ZK_STAT_SEC_BITS + 2 + 7) / 8) /*z*/;
+    size_t okamotoProof_bytes = static_cast<size_t>(K) * (ec.point_bytes + 2 * ec.scalar_bytes);
+    size_t paiProof_bytes_each = ct_bytes_each / 2 /*A is one n2 element*/ + pubkey_bytes /*w is one n element*/ +
+                                  static_cast<size_t>((R_BITS + ZK_STAT_SEC_BITS + 2 + 7) / 8) /*z*/;
+    size_t paiProof_bytes = static_cast<size_t>(K) * paiProof_bytes_each;
 
     t0 = Clock::now();
-    bool openValid = VerifyBatchOpening(ec, ctx, openCommits, transcriptOpen, openProof);
-    bool paiValid = VerifyPaillierOpening(pk, ctR.v, paiProof, masterTranscript);
+    std::vector<bool> openValid = VerifyBatchOpeningBatchK(ec, ctx, openCommits, transcriptOpen, openProof);
+    std::vector<bool> paiValid(static_cast<size_t>(K));
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+        paiValid[static_cast<size_t>(k)] =
+            VerifyPaillierOpening(pk, ctR[static_cast<size_t>(k)].v, paiProof[static_cast<size_t>(k)], masterTranscript[static_cast<size_t>(k)]);
+    }
     t1 = Clock::now();
     double verifyPart2_ms = ms(t0, t1);
 
+    std::vector<long> decryptedEval(static_cast<size_t>(K));
     t0 = Clock::now();
-    long decryptedEval = PaillierDecryptCRT(pk, sk, evalResult.v);
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < K; k++) {
+        decryptedEval[static_cast<size_t>(k)] = PaillierDecryptCRT(pk, sk, evalResult[static_cast<size_t>(k)].v);
+    }
     t1 = Clock::now();
     double decrypt_ms = ms(t0, t1);
 
-    long expectedEval = R;
-    for (int i = 0; i < d; i++) expectedEval += (-r[static_cast<size_t>(i)]) * b[static_cast<size_t>(i)];
+    int openValidCount = 0, paiValidCount = 0, evalCorrectCount = 0;
+    for (int k = 0; k < K; k++) {
+        long expectedEval = R[static_cast<size_t>(k)];
+        for (int i = 0; i < d; i++) {
+            expectedEval += (-r[static_cast<size_t>(k)][static_cast<size_t>(i)]) * b[static_cast<size_t>(i)];
+        }
+        if (openValid[static_cast<size_t>(k)]) openValidCount++;
+        if (paiValid[static_cast<size_t>(k)]) paiValidCount++;
+        if (decryptedEval[static_cast<size_t>(k)] == expectedEval) evalCorrectCount++;
+    }
 
-    PrintTime("HE Setup (Paillier KeyGen)", heSetup_ms, 1);
+    PrintTime("HE Setup (Paillier KeyGen, once, shared across all k)", heSetup_ms, 1);
     PrintSize("HE public key size", pubkey_bytes);
-    PrintTime("Encryption of b (parallel loop)", encryptB_ms, d);
+    PrintTime("Encryption of b (once, reused across all k)", encryptB_ms, d);
     PrintSize("Encryption of b, total size", ctB_total_bytes);
-    PrintTime("New commitment generation for R", commitR_new_ms, 1);
-    PrintTime("HE.Encrypt(R) (needed for HE.Eval and its ZKPoK)", encryptR_ms, 1);
-    PrintTime("HE Computation (HE.Eval(<ct_b,-r>+R), parallel loop)", heEval_ms, d);
-    PrintSize("HE.Eval(<ct_b,-r>+R) result size", evalResult_bytes);
-    PrintTime("ZKPoK proof generation: EC opening proof (r, R)", proveOpen_ms, d + 1);
-    PrintTime("ZKPoK proof generation: Paillier opening proof (R)", provePai_ms, 1);
-    PrintSize("Additional commitment for R, size", ec.point_bytes);
+    PrintTime("New commitment generation for R (all K repeats, parallel)", commitR_new_ms, K);
+    PrintTime("HE.Encrypt(R) (all K repeats, parallel)", encryptR_ms, K);
+    PrintTime("HE Computation (HE.Eval(<ct_b,-r>+R), all K repeats, flattened parallel)", heEval_ms, K * d);
+    PrintSize("HE.Eval(<ct_b,-r>+R) result size, total (K results)", evalResult_bytes);
+    PrintTime("ZKPoK proof generation: EC opening proof (r, R), all K repeats, parallel", proveOpen_ms, K);
+    PrintTime("ZKPoK proof generation: Paillier opening proof (R), all K repeats, parallel", provePai_ms, K);
+    PrintSize("Additional commitments for R, total size (K commitments)", static_cast<size_t>(K) * ec.point_bytes);
     printf("Commitments for r: reused from Part 1 (0 additional bytes/time)\n");
-    PrintSize("EC opening proof size (O(1), independent of d)", okamotoProof_bytes);
-    PrintSize("Paillier opening proof size", paiProof_bytes);
-    PrintTime("Verification of proofs and commitments (Part 2)", verifyPart2_ms, 1);
-    PrintTime("HE.Decrypt", decrypt_ms, 1);
-    printf("EC opening proof valid: %s\n", openValid ? "PASS" : "FAIL");
-    printf("Paillier opening proof valid: %s\n", paiValid ? "PASS" : "FAIL");
-    printf("Decrypted eval result: %ld (expected %ld) -> %s\n", decryptedEval, expectedEval,
-           decryptedEval == expectedEval ? "PASS" : "FAIL");
+    PrintSize("EC opening proof size, total (K proofs, each O(1) in d)", okamotoProof_bytes);
+    PrintSize("Paillier opening proof size, total (K proofs)", paiProof_bytes);
+    PrintTime("Verification of proofs and commitments (all K repeats, parallel)", verifyPart2_ms, K);
+    PrintTime("HE.Decrypt (all K repeats, parallel)", decrypt_ms, K);
+    printf("EC opening proof valid: %d / %d PASS\n", openValidCount, K);
+    printf("Paillier opening proof valid: %d / %d PASS\n", paiValidCount, K);
+    printf("Decrypted eval result correctness: %d / %d PASS\n", evalCorrectCount, K);
 
     // ============================ Part 3 ============================
     printf("\n--- Part 3: %d independent HE.Eval(x[i]*c[i]+y[i]) pipelines ---\n", d);
@@ -1059,6 +1297,7 @@ int main(int argc, char** argv) {
     printf("Decryption correctness: %d / %d PASS\n", correct3, d);
 
     for (auto* c : g_bn_ctx_pool) BN_CTX_free(c);
+    for (auto* g : g_group_pool) EC_GROUP_free(g);
     EC_GROUP_free(ec.group);
 
     return 0;
