@@ -532,8 +532,8 @@ bool MapLTinGTtoG1WithEncryptedLUT(pairing_t pairing,
     }
 
     // The real pre-activation value fell outside the LUT's [min_x, max_x]
-    // domain -- expected, since the domain is a single term's product range
-    // and is not scaled by FEATURE_SIZE. The row masks (z1, z4, betad,
+    // domain. The domain covers every reachable pre-activation sum, so this
+    // is only a safety net. The row masks (z1, z4, betad,
     // Bstar) are already known at this call site, so rather than fail the
     // whole pipeline we draw a value uniformly from the LUT's own declared
     // range and mask it exactly as a real row would have been built,
@@ -1260,12 +1260,9 @@ int main() {
         total_encrypt_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
-        // Domain is a single term's product range [MIN_X*MAX_X, MIN_X*MIN_X],
-        // NOT scaled by FEATURE_SIZE -- the LUT stays a fixed size regardless
-        // of how many inputs feed this neuron. Sums that land outside this
-        // range are handled at lookup time by the known-mask fallback in
-        // MapLTinGTtoG1WithEncryptedLUT.
-        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, (MIN_X) * (MAX_X), (MIN_X) * (MIN_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
+        // Domain is the full range of the pre-activation sum of FEATURE_SIZE
+        // products: [FEATURE_SIZE*MIN_X*MAX_X, FEATURE_SIZE*MIN_X*MIN_X].
+        sample_data.lut = BuildEncryptedLookupTable(pairing, &sample_data.pk, FEATURE_SIZE * (MIN_X) * (MAX_X), FEATURE_SIZE * (MIN_X) * (MIN_X), r3, r2, alpha_sample, beta_sample, msk.det_B, z1, z4[sample], betad, Bstar, sample);
         stop = std::chrono::steady_clock::now();
         total_lut_build_ms += std::chrono::duration<double, std::milli>(stop - start).count();
         size_t lut_size_bytes = estimate_lut_size_bytes(sample_data.lut);

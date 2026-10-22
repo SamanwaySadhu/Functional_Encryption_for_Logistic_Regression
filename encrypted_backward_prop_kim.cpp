@@ -1645,7 +1645,7 @@ int main() {
         total_encrypt_us += std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count();
 
         start = std::chrono::steady_clock::now();
-        s.lut = BuildEncryptedLookupTable(pairing, &s.pk, (BATCH_SIZE) * (MIN_X) * (MAX_X), BATCH_SIZE * (MAX_X) * (MAX_X), z3 - z4, z1, s.alpha_sample, s.beta_sample, s.msk.det_B);
+        s.lut = BuildEncryptedLookupTable(pairing, &s.pk, (BATCH_SIZE) * (MIN_X) * (MAX_X), BATCH_SIZE * (MIN_X) * (MIN_X), z3 - z4, z1, s.alpha_sample, s.beta_sample, s.msk.det_B);
         stop = std::chrono::steady_clock::now();
         total_lut_build_ms += std::chrono::duration<double, std::milli>(stop - start).count();
         total_lut_size_bytes += static_cast<long double>(estimate_lut_size_bytes(s.lut));
